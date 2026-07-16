@@ -8,6 +8,7 @@ from settings.settings import logging_settings, model_settings, secret_settings
 from schemas.schemas import HealthResponse
 from logger import setup_logger
 from utils.utils import Utils
+from api.routes import router
 
 # Heavy imports that touch torch/multiprocessing are deferred until the
 # application `lifespan` so `Utils.configure_multiprocessing()` can run
@@ -28,7 +29,6 @@ async def lifespan(app: FastAPI):
     from engine.model_loader import model_loader
     from scheduler.batch_scheduler import BatchScheduler
     from scheduler.continuous_scheduler import ContinuousScheduler
-    from api.routes import router
     from engine.generator import engine
 
     # Hugging Face authentication
@@ -58,9 +58,6 @@ async def lifespan(app: FastAPI):
     batch_scheduler_task = asyncio.create_task(batch_scheduler.run())
     logger.info("Schedulers setup completed...")
 
-    # Include routers after they are available
-    app.include_router(router, prefix="/api")
-    
     yield
     
     logger.info("Stopping schedulers...")
@@ -79,6 +76,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="LLM Inference Server", version="0.1.0", lifespan=lifespan)
+    app.include_router(router, prefix="/api")
 
     @app.get("/")
     def root():
