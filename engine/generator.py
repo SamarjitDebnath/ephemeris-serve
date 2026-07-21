@@ -149,7 +149,9 @@ class InferenceEngine:
         if self.model is None:
             raise RuntimeError("Model failed to load")
         return self.model.config.eos_token_id
-
+    
+    # This method is just for rapid prototyping and testing. It is not used in the continuous scheduler.
+    # Reason: It is slower and has no eviction/insertion logic for the KV cache, which is essential for continuous generation.
     def generate(self, input_ids, max_tokens: int = -1, temperature: float = -1.0):
         input_ids = input_ids.to(self.device)
 
@@ -190,6 +192,7 @@ class InferenceEngine:
 
                 yield next_token.item()
 
+    # It is recommended to use the generate_batch method for batched generation in production.
     async def generate_batch(self, input_ids, attention_mask, requests):
         from scheduler.request import ActiveRequest
         

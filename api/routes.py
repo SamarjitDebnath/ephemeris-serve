@@ -38,6 +38,7 @@ async def generate(req: GenerateRequest, request: Request):
     await request_queue.put(inference_request)
     logger.debug("Enqueued inference request and returning SSE stream")
 
+    # TODO: Consider creating a separate function to handle the cancellation logic for better testability and maintainability.
     async def cancel_on_disconnect() -> None:
         """Monitor for client disconnection and cancel the request."""
         try:
@@ -77,6 +78,7 @@ async def generate_batch(batch_req: BatchGenerateRequest, request: Request):
         batch_request.deadline = batch_request.enqueue_time + 20.0
         batch_requests.append(batch_request)
 
+    # TODO: Consider creating a separate function to handle the cancellation logic for better testability and maintainability.
     async def cancel_on_disconnect() -> None:
         try:
             while not await request.is_disconnected():
@@ -115,6 +117,7 @@ async def generate_batch(batch_req: BatchGenerateRequest, request: Request):
             raise HTTPException(status_code=500, detail=f"Unexpected non-string batch result: {type(result).__name__}")
         outputs.append(result)
 
+    # TODO: Consider moving the metrics calculation to a separate function or class for better testability and maintainability.
     queue_latency_values = [getattr(req, "queue_latency_ms", None) for req in batch_requests]
     valid_queue_values = [value for value in queue_latency_values if value is not None]
     queue_latency_ms = (

@@ -89,3 +89,7 @@ temp/
 *.bak
 *.swp
 *.swo
+
+# Development artifacts and internal files
+internal/
+unused_code/
