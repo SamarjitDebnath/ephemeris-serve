@@ -7,7 +7,7 @@ Ephemeris Serve
 
 Ephemeris Serve is an LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.
 
-**[Project site](https://samarjitdebnath.github.io/llm-inference-server/) · [API reference](https://samarjitdebnath.github.io/llm-inference-server/api.html)**
+**[Project site](https://samarjitdebnath.github.io/ephemeris-serve/) · [API reference](https://samarjitdebnath.github.io/ephemeris-serve/api.html)**
 
 Key features
 ------------
