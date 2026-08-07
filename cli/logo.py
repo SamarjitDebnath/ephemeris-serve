@@ -1,7 +1,7 @@
 """Block-character rendering of the Ephemeris Serve logo, for the CLI splash.
 
 Precomputed (not regenerated at runtime) from the vector art in
-`asset/images/ephemeris-serve-logo.svg` -- an astronomical-instrument motif
+`docs/assets/images/ephemeris-serve-logo.svg` -- an astronomical-instrument motif
 (graduated scale ring, tilted elliptical orbit, position markers, crosshair)
 rasterized onto a 36x36 grid, with a wider stroke threshold than a literal
 1:1 trace for a smaller, bolder mark, and packed two rows per output line

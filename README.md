@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="asset/images/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo" width="200">
+  <img src="docs/assets/images/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo" width="200">
 </p>
 
 Ephemeris Serve
@@ -88,9 +88,9 @@ Type a message and press Enter; `/exit`, `/quit`, or Ctrl-D ends the session. Ea
 
 `--creativity` picks a friendly sampling-temperature preset (`deterministic`, `balanced`, `creative`, `high-freedom`) instead of a raw float; `--temperature <value>` is still available when you want exact control. Both the model and the creativity level can also be changed mid-session, without restarting the REPL: `/model [name]` views or hot-swaps the loaded model, and `/creativity [preset|number]` views or changes the sampling temperature for the next turn onward.
 <p align="center">
-  <img src="asset/images/chat-cli1.png" alt="Ephemeris Serve CLI startup splash" width="700"><br>
-  <img src="asset/images/chat-cli2.png" alt="Ephemeris Serve CLI /model command" width="700"><br>
-  <img src="asset/images/chat-cli3.png" alt="Ephemeris Serve CLI chat session" width="700">
+  <img src="docs/assets/images/chat-cli1.png" alt="Ephemeris Serve CLI startup splash" width="700"><br>
+  <img src="docs/assets/images/chat-cli2.png" alt="Ephemeris Serve CLI /model command" width="700"><br>
+  <img src="docs/assets/images/chat-cli3.png" alt="Ephemeris Serve CLI chat session" width="700">
 </p>
 
 Configuration
@@ -172,6 +172,7 @@ Project layout
 - `settings/` — configuration and secrets
 - `schemas/` — Pydantic request/response models
 - `tests/` — unit and integration tests
+- `docs/` — microsite (landing page + API reference), served directly by GitHub Pages from `main` / `docs`
 
 Contributing
 ------------
