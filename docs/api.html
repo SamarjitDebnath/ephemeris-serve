@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Reference — Ephemeris Serve</title>
+<meta name="description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health.">
+<link rel="icon" href="assets/ephemeris-serve-logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="./">
+      <img src="assets/ephemeris-serve-logo.svg" alt="">
+      Ephemeris Serve
+    </a>
+    <nav class="site-nav">
+      <a href="./">Home</a>
+      <a href="api.html" class="active">API Reference</a>
+      <a href="https://github.com/SamarjitDebnath/llm-inference-server">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section style="padding-top: 3rem;">
+    <h2 style="margin-bottom:0.4rem;">API Reference</h2>
+    <p style="color:var(--text-muted); margin-top:0;">Base URL: <code>http://&lt;host&gt;:8000</code>. Routes under <code>/api</code> are mounted from <code>api/routes.py</code>; <code>/</code> and <code>/health</code> are top-level.</p>
+  </section>
+
+  <section>
+
+    <div class="endpoint">
+      <h3><span class="method get">GET</span> /</h3>
+      <p class="desc">Root welcome message. Useful as an unauthenticated liveness check.</p>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method get">GET</span> /health</h3>
+      <p class="desc">Returns JSON health status.</p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>status</code></td><td>string</td><td>The health status of the server.</td></tr>
+      </table>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method post">POST</span> /api/generate</h3>
+      <p class="desc">Enqueues an <code>InferenceRequest</code> and returns a streaming <code>text/event-stream</code> response of decoded tokens. Returns <code>503</code> while a model swap is in progress.</p>
+      <p><strong>Request body</strong></p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>prompt</code></td><td>string (required)</td><td>The input text for the model. Must be non-empty.</td></tr>
+        <tr><td><code>max_tokens</code></td><td>integer</td><td>1–2048. Optional.</td></tr>
+        <tr><td><code>temperature</code></td><td>float</td><td>0.0–2.0. Optional.</td></tr>
+        <tr><td><code>idempotency_key</code></td><td>string</td><td>Optional client-supplied key (max 200 chars) to deduplicate retried requests. A repeated key replays the cached result while the original is still in flight, or returns <code>409</code> if it's genuinely a duplicate in-flight request.</td></tr>
+        <tr><td><code>stop</code></td><td>string[]</td><td>Up to 4 non-empty stop sequences; generation halts before emitting any of them.</td></tr>
+      </table>
+      <p style="margin-top:1rem;"><strong>Example</strong></p>
+      <pre><code>curl -N -H "Accept: text/event-stream" \
+  -H "Content-Type: application/json" \
+  -X POST \
+  -d '{"prompt":"Hello world","max_tokens":50,"temperature":0.7}' \
+  http://localhost:8000/api/generate</code></pre>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method post">POST</span> /api/generate_batch</h3>
+      <p class="desc">Non-streaming batched generation. Accepts one or more requests and returns aggregated text output once every item in the batch has completed. Returns <code>503</code> during a model swap, <code>504</code> on batch timeout, and <code>499</code> if the client disconnects mid-batch.</p>
+      <p><strong>Request body</strong></p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>requests</code></td><td>GenerateRequest[] (required)</td><td>At least one generation request, same shape as <code>/api/generate</code>'s body.</td></tr>
+      </table>
+      <p><strong>Response body</strong></p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>outputs</code></td><td>string[]</td><td>Decoded output text for each item in the batch, in order.</td></tr>
+        <tr><td><code>batch_size</code></td><td>integer</td><td>Number of requests processed in the batch.</td></tr>
+        <tr><td><code>queue_latency_ms</code></td><td>float | null</td><td>Average queue latency for this batch.</td></tr>
+        <tr><td><code>token_throughput_per_sec</code></td><td>float | null</td><td>Token throughput for this batch.</td></tr>
+      </table>
+      <p style="margin-top:1rem;"><strong>Example</strong></p>
+      <pre><code>curl -H "Content-Type: application/json" \
+  -X POST \
+  -d '{"requests": [{"prompt": "Hello world", "max_tokens": 50, "temperature": 0.7}]}' \
+  http://localhost:8000/api/generate_batch</code></pre>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method get">GET</span> /api/model</h3>
+      <p class="desc">Returns the model currently loaded and serving requests.</p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>model_name</code></td><td>string</td><td>Hugging Face model repo id currently loaded.</td></tr>
+      </table>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method post">POST</span> /api/model</h3>
+      <p class="desc">Hot-swaps the model this server is running without a process restart. In-flight requests are drained before the swap; <code>/api/generate</code> and <code>/api/generate_batch</code> reject with <code>503</code> for the duration. Returns <code>409</code> if a swap is already in progress, <code>504</code> if draining exceeds the timeout.</p>
+      <p><strong>Request body</strong></p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>model_name</code></td><td>string (required)</td><td>Hugging Face model repo id to load.</td></tr>
+        <tr><td><code>drain_timeout_seconds</code></td><td>float</td><td>Max seconds to wait for in-flight requests to finish before swapping. Defaults to <code>scheduler_config.model_swap_drain_timeout_seconds</code>.</td></tr>
+      </table>
+      <p style="margin-top:1rem;"><strong>Example</strong></p>
+      <pre><code>curl -H "Content-Type: application/json" \
+  -X POST \
+  -d '{"model_name": "Qwen/Qwen2.5-0.5B"}' \
+  http://localhost:8000/api/model</code></pre>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method get">GET</span> /api/metrics</h3>
+      <p class="desc">Exposes queue latency, batch size, and token throughput metrics.</p>
+      <table>
+        <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>batch</code></td><td>object</td><td>Snapshot of batch-inference metrics (queue latency, batch size, throughput).</td></tr>
+        <tr><td><code>streaming</code></td><td>object</td><td>Snapshot of streaming-inference metrics.</td></tr>
+      </table>
+      <p style="margin-top:1rem;"><strong>Example</strong></p>
+      <pre><code>curl http://localhost:8000/api/metrics</code></pre>
+    </div>
+
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Ephemeris Serve</span>
+    <span><a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/LICENSE">License</a></span>
+  </div>
+</footer>
+
+</body>
+</html>

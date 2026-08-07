@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ephemeris Serve — LLM inference server</title>
+<meta name="description" content="Ephemeris Serve is an LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.">
+<link rel="icon" href="assets/ephemeris-serve-logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="./">
+      <img src="assets/ephemeris-serve-logo.svg" alt="">
+      Ephemeris Serve
+    </a>
+    <nav class="site-nav">
+      <a href="./" class="active">Home</a>
+      <a href="api.html">API Reference</a>
+      <a href="https://github.com/SamarjitDebnath/llm-inference-server">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <img class="logo" src="assets/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo">
+    <h1>Ephemeris Serve</h1>
+    <p class="tagline">An LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.</p>
+    <div class="cta">
+      <a class="btn primary" href="#quick-start">Quick start</a>
+      <a class="btn secondary" href="api.html">API reference</a>
+      <a class="btn secondary" href="https://github.com/SamarjitDebnath/llm-inference-server">View on GitHub</a>
+    </div>
+  </div>
+
+  <section id="features">
+    <h2>Features</h2>
+    <div class="features">
+      <div class="feature">
+        <h3>Continuous scheduling</h3>
+        <p>A request queue and continuous scheduler keep the GPU/CPU busy without waiting for a full batch to fill.</p>
+      </div>
+      <div class="feature">
+        <h3>Dynamic batching</h3>
+        <p>Streaming and non-streaming batch inference paths both batch requests dynamically for throughput.</p>
+      </div>
+      <div class="feature">
+        <h3>SSE token streaming</h3>
+        <p>Server-Sent Events stream decoded tokens as they're generated, for low-latency client rendering.</p>
+      </div>
+      <div class="feature">
+        <h3>Cancellation &amp; timeouts</h3>
+        <p>Explicit request cancellation, per-request deadlines, and cache-state fallback handling.</p>
+      </div>
+      <div class="feature">
+        <h3>Hot model swap</h3>
+        <p>Swap the loaded model in place via <code>/api/model</code>, draining in-flight requests first — no restart.</p>
+      </div>
+      <div class="feature">
+        <h3>Metrics &amp; health</h3>
+        <p>Queue latency, batch size, and token throughput metrics, plus a lightweight FastAPI health check.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="quick-start">
+    <h2>Quick start</h2>
+    <p>Prerequisites: Python 3.11+, a supported GPU (optional), and access to the Hugging Face Hub for authenticated model downloads.</p>
+    <pre><code>python -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e .</code></pre>
+    <p>Run the server for development:</p>
+    <pre><code>python main.py
+# or with uvicorn directly
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload</code></pre>
+  </section>
+
+  <section id="cli">
+    <h2>CLI chat client</h2>
+    <p><code>ephemeris-serve</code> ships two subcommands: <code>serve</code> starts the inference server, and <code>start</code> is a REPL that talks to an already-running server over <code>/api/generate</code>'s SSE stream.</p>
+    <pre><code># start the server in one terminal
+ephemeris-serve serve
+ephemeris-serve serve --model Qwen/Qwen2.5-0.5B
+
+# chat with it from another terminal
+ephemeris-serve start
+ephemeris-serve start --host 127.0.0.1 --port 8000 --max-tokens 128 --creativity creative</code></pre>
+    <p><code>--creativity</code> picks a friendly sampling-temperature preset (<code>deterministic</code>, <code>balanced</code>, <code>creative</code>, <code>high-freedom</code>); both the model and the creativity level can be changed mid-session with <code>/model</code> and <code>/creativity</code>.</p>
+    <div class="shots">
+      <img src="assets/chat-cli1.png" alt="Ephemeris Serve CLI startup splash">
+      <img src="assets/chat-cli2.png" alt="Ephemeris Serve CLI /model command">
+      <img src="assets/chat-cli3.png" alt="Ephemeris Serve CLI chat session">
+    </div>
+  </section>
+
+  <section id="learn-more">
+    <h2>Learn more</h2>
+    <p>
+      <a href="api.html">API reference</a> — every endpoint, request/response schema, and a curl example.<br>
+      <a href="https://github.com/SamarjitDebnath/llm-inference-server">GitHub repository</a> — source, issues, and contribution guide.<br>
+      <a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/TECHNICAL_DOCUMENTATION.md">Technical documentation</a> — architecture and internals.<br>
+      <a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/CHANGELOG.md">Changelog</a>
+    </p>
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Ephemeris Serve</span>
+    <span><a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/LICENSE">License</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
