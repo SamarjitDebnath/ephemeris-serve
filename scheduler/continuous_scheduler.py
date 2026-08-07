@@ -139,6 +139,7 @@ class ContinuousScheduler:
                 
                 if req.deadline is not None and req.deadline <= time.monotonic():
                     logger.info("Dropping already-expired request before scheduling: prompt=%s", req.prompt)
+                    streaming_metrics.record_timeout_eviction()
                     self._fail_request_timeout(req)
                     continue
 
@@ -431,6 +432,7 @@ class ContinuousScheduler:
         cancelled = [r for r in self.active_requests if r.future.cancelled()]
         for req in cancelled:
             self._free_block_table(req)
+            streaming_metrics.record_cancelled_eviction()
         self.active_requests = [r for r in self.active_requests if not r.future.cancelled()]
 
     def _free_block_table(self, req: InferenceRequest) -> None:
@@ -453,6 +455,7 @@ class ContinuousScheduler:
         still_active = []
         for req in self.active_requests:
             if req.deadline is not None and req.deadline <= now:
+                streaming_metrics.record_timeout_eviction()
                 if req.generated_tokens:
                     self._finish_request(req)
                 else:
@@ -553,6 +556,16 @@ class ContinuousScheduler:
 
         streaming_metrics.record_batch_size(active_count)
         streaming_metrics.record_token_throughput(active_count, time.monotonic() - step_start)
+        streaming_metrics.record_batch_occupancy(active_count, self.max_batch_size)
+        # Use the already-constructed cache, if any, rather than the
+        # `paged_cache` property -- this step may not have touched the
+        # paged cache at all (e.g. `_prepare_batch` is mocked out in tests),
+        # and this metric isn't worth forcing it to build.
+        if self._paged_cache is not None:
+            streaming_metrics.record_cache_utilization(
+                self._paged_cache.capacity - len(self._paged_cache.free_blocks),
+                self._paged_cache.capacity,
+            )
 
     async def run(self):
         """Main scheduler loop.

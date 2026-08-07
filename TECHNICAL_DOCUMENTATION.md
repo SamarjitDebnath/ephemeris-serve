@@ -378,7 +378,7 @@ Imports:
 - While `len(self.active_requests) < self.max_batch_size`: calls `await asyncio.wait_for(request_queue.get(), timeout=self.timeout)`; on timeout, returns.
 - For each dequeued `InferenceRequest`:
   - Applies a chat prompt template if the tokenizer exposes `apply_chat_template()` (formats the prompt as a single `user` message, `add_generation_prompt=True`), otherwise uses the raw prompt. A template failure is caught and logged, falling back to the raw prompt.
-  - If `req.deadline` has already passed (e.g. it sat behind a long queue backlog), the request is failed immediately via `_fail_request_timeout()` and never scheduled -- no forward-pass compute is spent on an already-dead request.
+  - If `req.deadline` has already passed (e.g. it sat behind a long queue backlog), calls `streaming_metrics.record_timeout_eviction()` and fails the request immediately via `_fail_request_timeout()` without ever scheduling it -- no forward-pass compute is spent on an already-dead request.
   - Encodes the resulting text via `self.tokenizer.tokenizer(..., return_tensors='pt')` and moves `input_ids` to `self.engine.device`.
   - `req.block_table` starts empty (from `InferenceRequest.__init__`) -- that's the "no KV cache yet" signal for the first step.
   - Records `req.queue_latency_ms = time.monotonic() - req.enqueue_time` and calls `streaming_metrics.record_queue_latency(...)` exactly once per admitted request.
@@ -434,7 +434,7 @@ Called when a generation step fails twice in a row (see `_step()`). Sets `exc` -
 
 #### `_evict_cancelled_requests()`
 
-Filters `self.active_requests` to drop any request whose `future.cancelled()` is `True` (set by `api/routes.py`'s disconnect-polling task), freeing its block table. No finalization is attempted -- the future is already terminal, and there's no client left to read `req.queue`.
+Filters `self.active_requests` to drop any request whose `future.cancelled()` is `True` (set by `api/routes.py`'s disconnect-polling task), freeing its block table and calling `streaming_metrics.record_cancelled_eviction()`. No finalization is attempted -- the future is already terminal, and there's no client left to read `req.queue`.
 
 #### `_free_block_table(req)`
 
@@ -442,7 +442,7 @@ Returns a request's paged KV blocks to the pool, if it has any (`block_table.blo
 
 #### `_evict_expired_requests()`
 
-Evicts any request whose `deadline` has passed: if it already generated at least one token, finished with that partial output via `_finish_request()`; otherwise failed via `_fail_request_timeout()`.
+Evicts any request whose `deadline` has passed: calls `streaming_metrics.record_timeout_eviction()`, then if it already generated at least one token, finishes it with that partial output via `_finish_request()`; otherwise fails it via `_fail_request_timeout()`. The same counter is also incremented in `_add_new_requests()` when a request's deadline has already passed *before* it's ever scheduled (see below) -- both are the same underlying event (a request never got its full generation window), just caught at different points.
 
 #### `_forward_and_sample(batch_inputs)`
 
@@ -458,6 +458,7 @@ Coordinates a single scheduler iteration:
 5. `await self._dispatch_tokens(next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths)`.
 6. Device memory is released proactively rather than only on failure/idle: if `self.active_requests` is now empty, calls `empty_device_cache(self.engine.device)` unconditionally; otherwise calls `maybe_empty_device_cache(self.engine.device)`, which only clears once usage crosses 70% of the device's memory budget (a cheap metadata query every step via `utils.device_cache.device_memory_pressure()`, not a device sync). This closes the gap where a single long-running request that never hits a failure or an idle gap could otherwise accumulate cached-but-unused memory all the way to the device's actual ceiling (observed as `MPS backend out of memory`).
 7. Records `streaming_metrics.record_batch_size(active_count)` and `streaming_metrics.record_token_throughput(active_count, elapsed)` -- one token per active request per step.
+8. Records `streaming_metrics.record_batch_occupancy(active_count, self.max_batch_size)`. Also records `streaming_metrics.record_cache_utilization(...)` -- but only if `self._paged_cache` has actually been constructed already (read directly, not via the `paged_cache` property), so this metric never itself forces the paged cache -- and therefore the model -- to build.
 
 #### `run()`
 
@@ -670,9 +671,11 @@ Rolling in-memory metrics tracking, exposed via `GET /api/metrics` (`api/routes.
 - `record_queue_latency(latency_seconds)`: appends if `>= 0`.
 - `record_batch_size(batch_size)`: appends if `> 0`.
 - `record_token_throughput(tokens, elapsed_seconds)`: appends `tokens / elapsed_seconds` if `elapsed_seconds > 0` and `tokens >= 0`.
-- `snapshot()`: returns `average_queue_latency_ms` (mean of `queue_latencies`, converted to ms, or `None` if empty), `average_batch_size`, `average_token_throughput_per_sec`, and a `_samples` count for each of the three deques.
+- `batch_occupancies`/`cache_utilizations`: fed only by the continuous scheduler -- `record_batch_occupancy(active_count, max_batch_size)` appends `active_count / max_batch_size` (skipped if `max_batch_size <= 0`); `record_cache_utilization(used_blocks, capacity_blocks)` appends `used_blocks / capacity_blocks` (skipped if `capacity_blocks <= 0`).
+- `timeout_evictions`/`cancelled_evictions`: plain counters (not deques), also fed only by the continuous scheduler -- `record_timeout_eviction()`/`record_cancelled_eviction()` each increment by 1.
+- `snapshot()`: returns `average_queue_latency_ms` (mean of `queue_latencies`, converted to ms, or `None` if empty), `average_batch_size`, `average_token_throughput_per_sec`, `average_batch_occupancy`, `average_cache_utilization`, a `_samples` count for each of the five deques, and the two raw eviction counters (`timeout_evictions`, `cancelled_evictions`).
 
-Two independent singletons -- `metrics` (batch path) and `streaming_metrics` (streaming path) -- so `/generate_batch` responses aren't polluted by concurrent SSE traffic and vice versa. `metrics` is fed by `scheduler/batch_scheduler.py`; `streaming_metrics` is fed by `scheduler/continuous_scheduler.py`. `GET /api/metrics` returns `{"batch": metrics.snapshot(), "streaming": streaming_metrics.snapshot()}`.
+Two independent singletons -- `metrics` (batch path) and `streaming_metrics` (streaming path) -- so `/generate_batch` responses aren't polluted by concurrent SSE traffic and vice versa. `metrics` is fed by `scheduler/batch_scheduler.py`; `streaming_metrics` is fed by `scheduler/continuous_scheduler.py`. Since `batch_occupancies`/`cache_utilizations`/the eviction counters are only ever recorded on `streaming_metrics`, they stay at their empty/zero defaults in the batch path's `metrics.snapshot()`. `GET /api/metrics` returns `{"batch": metrics.snapshot(), "streaming": streaming_metrics.snapshot()}`.
 
 `summarize_batch_response_metrics(batch_requests) -> {"queue_latency_ms": ..., "token_throughput_per_sec": ...}`:
 - Used by `/generate_batch` to assemble its per-response metrics fields. Queue latency is averaged over *this batch's own* requests (`req.queue_latency_ms` for each, converted to ms) -- a per-response figure, unlike throughput. `token_throughput_per_sec` is instead pulled from the rolling batch-path average (`metrics.snapshot()["average_token_throughput_per_sec"]`), since throughput is a per-engine-call measurement rather than something meaningfully computed per individual response.
@@ -927,7 +930,7 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 Key improvements that have been implemented:
 - **Request Cancellation**: Supported client-disconnect detection and request cancellation for batch generation, and enforced on the streaming path too -- `ContinuousScheduler` evicts cancelled requests every step instead of continuing to generate for a disconnected SSE client.
 - **Request Timeouts**: Configurable deadlines for both the batch path (`batch_request_timeout_seconds`, `batch_generation_timeout_seconds`) and the streaming path (`streaming_request_timeout_seconds`), sourced from `scheduler_settings`. An expired streaming request is finished with partial output if any tokens were generated, otherwise failed with an SSE `error` event.
-- **Runtime Metrics**: Queue latency, batch size, and token throughput tracking, exposed via `/api/metrics` as `{"batch": ..., "streaming": ...}` (separate singletons so `/generate_batch` responses aren't polluted by concurrent streaming traffic).
+- **Runtime Metrics**: Queue latency, batch size, and token throughput tracking, exposed via `/api/metrics` as `{"batch": ..., "streaming": ...}` (separate singletons so `/generate_batch` responses aren't polluted by concurrent streaming traffic). The streaming singleton also tracks scheduler-specific gauges/counters not applicable to the batch path: active-batch occupancy, paged-KV-cache block utilization, and timeout/cancellation eviction counts.
 - **Engine/Scheduler Decoupling**: `InferenceEngine.generate_batch()` depends on a local `GenerationRequest` `typing.Protocol` rather than importing a scheduler-owned wrapper type; `InferenceRequest` satisfies it structurally.
 - **Idempotency & Retry (Streaming)**: `/api/generate` accepts an optional `idempotency_key` (dedup via `scheduler/idempotency.py`); `ContinuousScheduler._step()` retries a failed generation step once before failing every active request with an SSE `error` event.
 - **Paged KV Cache with Mixed Prefill/Decode Batching**: the scheduler no longer processes a step as strictly "all prompts" or "all cached decode tokens" -- `cache/paged_kv_cache.PagedKVCache` (block-based storage, addressed per-request via `BlockTable`) lets a brand-new request's prefill share the same batched forward pass as requests already mid-decode, without forcing either kind of row to redo work it doesn't need to.
@@ -1005,7 +1008,7 @@ Future areas for improvement:
 Implemented enhancements:
 - Non-streaming batch endpoint support via `/api/generate_batch`.
 - Explicit request cancellation and timeout handling for both batch and streaming inference.
-- Metrics collection for queue latency, batch size, and token throughput, tracked separately for the batch and streaming paths.
+- Metrics collection for queue latency, batch size, and token throughput, tracked separately for the batch and streaming paths; the streaming path additionally tracks active-batch occupancy, paged-KV-cache utilization, and timeout/cancellation eviction counts.
 - Support for both SSE streaming and synchronous batch generation paths.
 - Client idempotency keys for deduplicating retried streaming requests.
 - Mixed prefill/decode batching via a paged KV cache, instead of a strictly "all-prefill or all-decode" step.
