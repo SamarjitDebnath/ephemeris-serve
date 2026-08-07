@@ -7,6 +7,7 @@ from scheduler.request import InferenceRequest
 from scheduler.request_queue import batch_request_queue
 from settings.settings import logging_settings, model_settings
 from tokenizer.tokenizer_service import tokenizer_service
+from utils.device_cache import empty_device_cache
 from metrics.metrics import metrics
 
 logger = setup_logger(__name__, level=logging_settings.log_level, log_file=logging_settings.log_file)
@@ -63,7 +64,6 @@ class BatchScheduler:
 
         for req in valid_requests:
             req.queue_latency_ms = time.monotonic() - req.enqueue_time
-            metrics.record_queue_latency(req.queue_latency_ms)
 
         prompts = [req.prompt for req in valid_requests]
         
@@ -140,6 +140,11 @@ class BatchScheduler:
                     await asyncio.sleep(0.01)
                     continue
                 await self.process_batch(batch)
+                # Release cached-but-unused device memory once this batch is
+                # fully done -- PyTorch's allocator otherwise holds onto it
+                # rather than returning it to the system, which can
+                # accumulate across many batches on a long-running process.
+                empty_device_cache(self.engine.device)
             except asyncio.CancelledError:
                 logger.info("Batch scheduler task cancelled")
                 raise

@@ -1,4 +1,4 @@
-.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs
+.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs build-ephemeris
 
 help:
 	@echo "LLM Inference Server - Available Commands"
@@ -11,6 +11,7 @@ help:
 	@echo "Running:"
 	@echo "  make run          - Run the server (development mode)"
 	@echo "  make run-prod     - Run the server (production mode)"
+	@echo "  make build-ephemeris - E2E: sync deps, install the CLI, start the server"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test-unit    - Run unit tests"
@@ -40,6 +41,12 @@ run:
 
 run-prod:
 	uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+
+build-ephemeris:
+	@echo "==> [1/2] Installing Ephemeris Serve and dependencies (uv sync)"
+	uv sync
+	@echo "==> [2/2] Starting the server -- once it's up, run 'ephemeris-serve start' in another terminal to chat"
+	uv run python main.py
 
 test-unit:
 	uv run pytest tests/ -v

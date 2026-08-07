@@ -3,11 +3,11 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "llm-inference-server"
+name = "ephemeris-serve"
 version = "0.1.0"
 description = "High-performance LLM inference server with continuous scheduling and dynamic batching"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.135.1",
     "pydantic-settings>=2.14.2",
@@ -19,7 +19,12 @@ dependencies = [
     "uvicorn>=0.24.0",
     "sse-starlette>=1.6.0",
     "psutil>=7.2.2",
+    "click>=8.4.1",
+    "httpx>=0.28.1",
 ]
+
+[project.scripts]
+ephemeris-serve = "cli.main:cli"
 
 [project.optional-dependencies]
 dev = [
@@ -36,6 +41,7 @@ dev = [
 [tool.setuptools]
 packages = [
     "api",
+    "cli",
     "engine",
     "logger",
     "scheduler",

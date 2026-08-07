@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from statistics import mean
-from typing import Deque, Dict
+from typing import Deque, Dict, Sequence
 
 
 class BatchMetrics:
@@ -44,3 +44,27 @@ class BatchMetrics:
 
 
 metrics = BatchMetrics()
+streaming_metrics = BatchMetrics()
+
+
+def summarize_batch_response_metrics(batch_requests: Sequence[object]) -> Dict[str, float | None]:
+    """Assemble the queue-latency/throughput fields returned by /generate_batch.
+
+    Queue latency is averaged over the batch's own requests; throughput is
+    pulled from the rolling batch-path average since it's a per-engine-call
+    measurement, not something computed per response.
+    """
+    queue_latency_values = [
+        getattr(req, "queue_latency_ms", None) for req in batch_requests
+    ]
+    valid_queue_values = [value for value in queue_latency_values if value is not None]
+    queue_latency_ms = (
+        (sum(valid_queue_values) / len(valid_queue_values)) * 1000.0
+        if valid_queue_values
+        else None
+    )
+    token_throughput_per_sec = metrics.snapshot()["average_token_throughput_per_sec"]
+    return {
+        "queue_latency_ms": queue_latency_ms,
+        "token_throughput_per_sec": token_throughput_per_sec,
+    }

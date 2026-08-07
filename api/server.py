@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from huggingface_hub import login
 import asyncio
 
-from settings.settings import logging_settings, model_settings, secret_settings
+from settings.settings import logging_settings, model_settings, scheduler_settings, secret_settings
 from schemas.schemas import HealthResponse
 from logger import setup_logger
 from utils.utils import Utils
@@ -53,8 +53,15 @@ async def lifespan(app: FastAPI):
     # setting up schedulers and include API router
     logger.info("Setting up continuous and batch schedulers...")
     scheduler = ContinuousScheduler(engine, tokenizer_service)
+    # Exposed so route handlers (e.g. POST /api/model) can reach the live
+    # scheduler instance -- it's otherwise only closed over by the task below.
+    app.state.scheduler = scheduler
     scheduler_task = asyncio.create_task(scheduler.run())
-    batch_scheduler = BatchScheduler(engine, tokenizer_service)
+    batch_scheduler = BatchScheduler(
+        engine,
+        tokenizer_service,
+        request_timeout=scheduler_settings.batch_request_timeout_seconds,
+    )
     batch_scheduler_task = asyncio.create_task(batch_scheduler.run())
     logger.info("Schedulers setup completed...")
 
@@ -75,12 +82,12 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down the server...")
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="LLM Inference Server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Ephemeris Serve", version="0.1.0", lifespan=lifespan)
     app.include_router(router, prefix="/api")
 
     @app.get("/")
     def root():
-        return {"message": "Welcome to the LLM Inference Server!"}
+        return {"message": "Welcome to Ephemeris Serve!"}
 
     @app.get("/health", response_model=HealthResponse)
     def health():

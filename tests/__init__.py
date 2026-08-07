@@ -1,1 +1,1 @@
-"""Test suite for LLM Inference Server"""
+"""Test suite for Ephemeris Serve"""

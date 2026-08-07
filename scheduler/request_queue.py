@@ -10,7 +10,11 @@ class RequestQueue:
 
     async def get(self):
         return await self.queue.get()
-    
+
+    def empty(self) -> bool:
+        return self.queue.empty()
+
+
 
 request_queue = RequestQueue()
 batch_request_queue = RequestQueue()

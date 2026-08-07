@@ -1,7 +1,11 @@
-LLM Inference Server
+<p align="center">
+  <img src="asset/images/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo" width="200">
+</p>
+
+Ephemeris Serve
 =====================
 
-LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.
+Ephemeris Serve is an LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.
 
 Key features
 ------------
@@ -59,7 +63,33 @@ make lint
 
 # Tail application logs
 make logs
+
+# E2E: sync deps, install the CLI entry point, and start the server
+make build-ephemeris
 ```
+
+CLI chat client
+----------------
+`ephemeris-serve` (installed via the `[project.scripts]` entry point, `cli/main.py`) has two subcommands: `serve` starts the inference server itself, and `start` is a `click`-based REPL that talks to an already-running server over `/api/generate`'s SSE stream -- it does not load a model itself. Both work as plain commands once the project's virtualenv is active (`source .venv/bin/activate`, or `uv sync` followed by activating `.venv`) -- no `uv run` prefix needed.
+
+```bash
+# start the server in one terminal
+ephemeris-serve serve
+ephemeris-serve serve --model Qwen/Qwen2.5-0.5B   # pick a model without editing config.yaml
+
+# chat with it from another terminal
+ephemeris-serve start
+ephemeris-serve start --host 127.0.0.1 --port 8000 --max-tokens 128 --creativity creative
+```
+
+Type a message and press Enter; `/exit`, `/quit`, or Ctrl-D ends the session. Each turn is an independent single-shot request -- the server doesn't retain conversation history between turns.
+
+`--creativity` picks a friendly sampling-temperature preset (`deterministic`, `balanced`, `creative`, `high-freedom`) instead of a raw float; `--temperature <value>` is still available when you want exact control. Both the model and the creativity level can also be changed mid-session, without restarting the REPL: `/model [name]` views or hot-swaps the loaded model, and `/creativity [preset|number]` views or changes the sampling temperature for the next turn onward.
+<p align="center">
+  <img src="asset/images/chat-cli1.png" alt="Ephemeris Serve CLI startup splash" width="700"><br>
+  <img src="asset/images/chat-cli2.png" alt="Ephemeris Serve CLI /model command" width="700"><br>
+  <img src="asset/images/chat-cli3.png" alt="Ephemeris Serve CLI chat session" width="700">
+</p>
 
 Configuration
 -------------

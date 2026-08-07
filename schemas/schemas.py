@@ -1,21 +1,42 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="The input text for the model")
-    
+
     max_tokens: int | None = Field(
-        default=None, 
-        ge=1, 
-        le=2048, 
+        default=None,
+        ge=1,
+        le=2048,
         description="Must be between 1 and 2048"
     )
-    
+
     temperature: float | None = Field(
-        default=None, 
-        ge=0.0, 
-        le=2.0, 
+        default=None,
+        ge=0.0,
+        le=2.0,
         description="Standard LLM temperature range is usually 0.0 to 2.0"
     )
+
+    idempotency_key: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Optional client-supplied key to deduplicate retried /generate requests",
+    )
+
+    stop: list[str] | None = Field(
+        default=None,
+        max_length=4,
+        description="Up to 4 strings; generation halts before emitting any of them.",
+    )
+
+    @field_validator("stop")
+    @classmethod
+    def _reject_empty_stop_strings(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return value
+        if any(not s for s in value):
+            raise ValueError("stop sequences must be non-empty strings")
+        return value
 
 class BatchGenerateRequest(BaseModel):
     requests: list[GenerateRequest] = Field(..., min_length=1, description="A list of generation requests to batch")
@@ -34,3 +55,17 @@ class BatchGenerateResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = Field(..., description="The health status of the server")
+
+class ModelSwapRequest(BaseModel):
+    model_name: str = Field(..., min_length=1, description="Hugging Face model repo id to load")
+    drain_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Max seconds to wait for in-flight requests to finish before swapping; "
+            "defaults to scheduler_config.model_swap_drain_timeout_seconds"
+        ),
+    )
+
+class ModelSwapResponse(BaseModel):
+    model_name: str = Field(..., description="The model currently loaded and serving requests")
