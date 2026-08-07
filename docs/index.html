@@ -77,6 +77,8 @@ pip install -e .</code></pre>
     <pre><code>python main.py
 # or with uvicorn directly
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload</code></pre>
+    <p>Or, the easier way — the repo's <code>Makefile</code> wraps the full setup in one command: sync dependencies, install the CLI entry point, and start the server.</p>
+    <pre><code>make build-ephemeris</code></pre>
   </section>
 
   <section id="cli">
