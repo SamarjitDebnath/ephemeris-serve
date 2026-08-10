@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/images/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo" width="160">
+  <img src="docs/assets/images/ephemeris-serve-logo.png" alt="Ephemeris Serve logo" width="160" style="border-radius: 20px;">
 </p>
 
 # Ephemeris Serve - Technical Documentation
@@ -728,7 +728,7 @@ Box-drawing helpers (all colored via `click.secho`, magenta borders unless noted
 
 ### `cli/logo.py`
 
-`LOGO_LINES: list[str]` -- a **precomputed** (not regenerated at runtime) 36-column-wide, 18-row block-character rendering of the Ephemeris Serve logo, built from the vector geometry in `docs/assets/images/ephemeris-serve-logo.svg` (an astronomical-instrument motif: graduated scale ring, tilted elliptical orbit, position markers, crosshair), rasterized onto a 36x36 grid with a wider stroke threshold than a literal 1:1 trace, for a smaller, bolder mark. Packed two rows per output line using Unicode half-block characters (`▀`/`▄`/`█`) for double vertical resolution -- hence 18 output lines for a 36-row grid. Originally a 48-wide/24-line rendering, shrunk so it fits more terminals without wrapping (see `_print_splash()`'s narrow-terminal skip, above).
+`LOGO_LINES: list[str]` -- a **precomputed** (not regenerated at runtime) 36-column-wide, 18-row block-character rendering of the Ephemeris Serve logo, built from the vector geometry in `docs/assets/images/ephemeris-serve-logo.png` (an astronomical-instrument motif: graduated scale ring, tilted elliptical orbit, position markers, crosshair), rasterized onto a 36x36 grid with a wider stroke threshold than a literal 1:1 trace, for a smaller, bolder mark. Packed two rows per output line using Unicode half-block characters (`▀`/`▄`/`█`) for double vertical resolution -- hence 18 output lines for a 36-row grid. Originally a 48-wide/24-line rendering, shrunk so it fits more terminals without wrapping (see `_print_splash()`'s narrow-terminal skip, above).
 
 It's precomputed rather than parsed from the SVG (or decoded from the sibling `.png`) at CLI startup for two reasons: decoding a large raster image in pure Python with no imaging library would be slow, and there's no need to re-derive a fixed piece of art on every invocation. There is currently no dependency (e.g. Pillow) added to the project for image handling.
 

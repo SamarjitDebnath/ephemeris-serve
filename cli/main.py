@@ -136,7 +136,7 @@ class _StreamingBox:
 
 def _print_splash() -> None:
     """Print the startup splash: a small welcome box, the block-art logo
-    (rendered from `docs/assets/images/ephemeris-serve-logo.svg`, see `cli/logo.py`),
+    (rendered from `docs/assets/images/ephemeris-serve-logo.png`, see `cli/logo.py`),
     and a "press Enter to continue" gate.
 
     Skipped (falls straight through) on terminals too narrow to fit the logo

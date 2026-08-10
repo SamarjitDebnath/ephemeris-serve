@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/images/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo" width="200">
+  <img src="docs/assets/images/ephemeris-serve-logo.png" alt="Ephemeris Serve logo" width="200" style="border-radius: 24px;">
 </p>
 
 Ephemeris Serve

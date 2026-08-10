@@ -3,95 +3,237 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ephemeris Serve — LLM inference server</title>
+<title>Ephemeris Serve — never wait for a full batch</title>
 <meta name="description" content="Ephemeris Serve is an LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.">
-<link rel="icon" href="assets/images/ephemeris-serve-logo.svg" type="image/svg+xml">
+<link rel="icon" href="assets/images/ephemeris-serve-logo.png" type="image/png">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
 
+<svg style="display:none" aria-hidden="true">
+  <symbol id="ephemeris-mark" viewBox="0 0 680 350">
+    <circle cx="340" cy="200" r="110" fill="none" stroke="currentColor" stroke-width="1.5"/>
+    <g stroke="currentColor" stroke-width="1.5">
+      <line x1="435.3" y1="255" x2="426.6" y2="250"/>
+      <line x1="395" y1="295.3" x2="390" y2="286.6"/>
+      <line x1="285" y1="295.3" x2="290" y2="286.6"/>
+      <line x1="244.7" y1="255" x2="253.4" y2="250"/>
+      <line x1="244.7" y1="145" x2="253.4" y2="150"/>
+      <line x1="285" y1="104.7" x2="290" y2="113.4"/>
+      <line x1="395" y1="104.7" x2="390" y2="113.4"/>
+      <line x1="435.3" y1="145" x2="426.6" y2="150"/>
+    </g>
+    <g stroke="currentColor" stroke-width="2.5">
+      <line x1="450" y1="200" x2="430" y2="200"/>
+      <line x1="340" y1="310" x2="340" y2="290"/>
+      <line x1="230" y1="200" x2="250" y2="200"/>
+      <line x1="340" y1="90" x2="340" y2="110"/>
+    </g>
+    <g class="orbit-spin" transform="rotate(-20 340 200)">
+      <ellipse cx="340" cy="200" rx="75" ry="38" fill="none" stroke="currentColor" stroke-width="3"/>
+      <line x1="340" y1="200" x2="377.5" y2="167.1" stroke="currentColor" stroke-width="1.5" stroke-dasharray="2 4"/>
+      <circle cx="377.5" cy="167.1" r="7" fill="currentColor"/>
+      <circle cx="405" cy="219" r="5" fill="currentColor"/>
+      <circle cx="275" cy="219" r="4" fill="currentColor"/>
+      <circle cx="314.35" cy="164.3" r="6" fill="currentColor"/>
+      <circle cx="326.95" cy="237.4" r="3" fill="currentColor"/>
+    </g>
+    <g stroke="currentColor" stroke-width="1.5">
+      <line x1="325" y1="200" x2="355" y2="200"/>
+      <line x1="340" y1="185" x2="340" y2="215"/>
+    </g>
+    <circle cx="340" cy="200" r="5" fill="currentColor"/>
+  </symbol>
+</svg>
+
 <header class="site">
   <div class="wrap">
     <a class="brand" href="./">
-      <img src="assets/images/ephemeris-serve-logo.svg" alt="">
+      <svg viewBox="0 0 680 350"><use href="#ephemeris-mark"></use></svg>
       Ephemeris Serve
     </a>
     <nav class="site-nav">
       <a href="./" class="active">Home</a>
       <a href="api.html">API Reference</a>
-      <a href="https://github.com/SamarjitDebnath/llm-inference-server">GitHub</a>
+      <a href="https://github.com/SamarjitDebnath/ephemeris-serve">GitHub</a>
     </nav>
+    <div class="header-right">
+      <span class="pill-tag">MIT licensed</span>
+      <a class="btn primary" href="#install">Install</a>
+    </div>
   </div>
 </header>
 
 <main>
   <div class="hero">
-    <img class="logo" src="assets/images/ephemeris-serve-logo.svg" alt="Ephemeris Serve logo">
-    <h1>Ephemeris Serve</h1>
-    <p class="tagline">An LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.</p>
-    <div class="cta">
-      <a class="btn primary" href="#quick-start">Quick start</a>
-      <a class="btn secondary" href="api.html">API reference</a>
-      <a class="btn secondary" href="https://github.com/SamarjitDebnath/llm-inference-server">View on GitHub</a>
+    <div class="medallion">
+      <img src="assets/images/ephemeris-serve-logo.png" alt="Ephemeris Serve logo">
+      <span class="wordmark">EPHEMERIS · SERVE</span>
+    </div>
+
+    <div class="eyebrow">
+      <span class="dot"></span>
+      <span class="label">Self-hosted · Open source · Single process</span>
+    </div>
+
+    <h1 class="headline serif">Never wait <span class="dim">for a full batch.</span></h1>
+
+    <p class="tagline">Ephemeris Serve is an LLM inference server built around one idea: a request should never sit idle while the batch fills up. A continuous scheduler folds new requests into the batch mid-flight, a paged KV cache lets prefill and decode share the same forward pass, and every token streams back over <code>SSE</code> the moment it's sampled.</p>
+
+    <div class="cta" id="install">
+      <div class="install-box">
+        <div class="install-tabs" role="tablist">
+          <button type="button" class="active" data-cmd="make">make</button>
+          <button type="button" data-cmd="uv">uv</button>
+          <button type="button" data-cmd="pip">pip</button>
+        </div>
+        <div class="install-cmd">
+          <span class="prompt">$</span>
+          <span id="cmd-text">make build-ephemeris</span>
+          <button type="button" class="copy" id="copy-btn">COPY</button>
+        </div>
+      </div>
+      <a class="docs-link" href="#quick-start">or read the quick start &rarr;</a>
+    </div>
+
+    <div class="credibility">
+      <span><b>Python 3.12+</b></span>
+      <span><b>Apple Silicon (MPS)</b> &amp; <b>CUDA</b></span>
+      <span><b>FastAPI</b> + <b>SSE</b></span>
+      <span>zero required config to start</span>
+    </div>
+
+    <div class="ephemeris">
+      <div class="ephemeris-head">
+        <span class="title"><b>ContinuousScheduler</b> — one batch, five ticks, eight slots</span>
+        <span class="title">max_batch_size = 8</span>
+      </div>
+      <div class="ephemeris-body">
+        <div class="tick-labels">
+          <div class="row-label"><span class="t">t+0</span>PREFILL</div>
+          <div class="row-label"><span class="t">t+1</span>DECODE</div>
+          <div class="row-label"><span class="t">t+2</span>JOIN</div>
+          <div class="row-label"><span class="t">t+3</span>DECODE</div>
+          <div class="row-label"><span class="t">t+4</span>EVICT</div>
+        </div>
+        <div class="grid-slots">
+          <div class="grid-row">
+            <div class="cell prefill"></div><div class="cell prefill"></div><div class="cell prefill"></div><div class="cell prefill"></div>
+            <div class="cell"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+          </div>
+          <div class="grid-row">
+            <div class="cell decode"></div><div class="cell decode"></div><div class="cell decode"></div><div class="cell decode"></div>
+            <div class="cell prefill"></div><div class="cell"></div><div class="cell"></div><div class="cell"></div>
+          </div>
+          <div class="grid-row">
+            <div class="cell decode"></div><div class="cell decode"></div><div class="cell decode"></div><div class="cell decode"></div>
+            <div class="cell decode"></div><div class="cell prefill"></div><div class="cell"></div><div class="cell"></div>
+          </div>
+          <div class="grid-row">
+            <div class="cell"></div><div class="cell decode"></div><div class="cell decode"></div><div class="cell decode"></div>
+            <div class="cell decode"></div><div class="cell decode"></div><div class="cell prefill"></div><div class="cell"></div>
+          </div>
+          <div class="grid-row">
+            <div class="cell"></div><div class="cell decode"></div><div class="cell decode"></div><div class="cell"></div>
+            <div class="cell decode"></div><div class="cell decode"></div><div class="cell decode"></div><div class="cell prefill"></div>
+          </div>
+        </div>
+        <div class="arch-labels">
+          <span>SCHEDULER</span>
+          <span>PAGED CACHE</span>
+          <span>STREAMING</span>
+          <span>METRICS</span>
+          <span>CLI</span>
+        </div>
+      </div>
+      <div class="ephemeris-foot">
+        <div class="legend">
+          <span class="key"><span class="swatch decode"></span>decoding</span>
+          <span class="key"><span class="swatch prefill"></span>prefill — just joined</span>
+          <span class="key"><span class="swatch idle"></span>idle / freed</span>
+        </div>
+      </div>
     </div>
   </div>
 
   <section id="features">
-    <h2>Features</h2>
+    <div class="section-head">
+      <h2>What the scheduler actually does</h2>
+      <p class="eyebrow-label">six things, working together</p>
+    </div>
     <div class="features">
       <div class="feature">
+        <span class="n">01</span>
         <h3>Continuous scheduling</h3>
-        <p>A request queue and continuous scheduler keep the GPU/CPU busy without waiting for a full batch to fill.</p>
+        <p>New requests join an already-running batch step, instead of waiting for the current one to finish.</p>
       </div>
       <div class="feature">
-        <h3>Dynamic batching</h3>
-        <p>Streaming and non-streaming batch inference paths both batch requests dynamically for throughput.</p>
+        <span class="n">02</span>
+        <h3>Mixed prefill + decode</h3>
+        <p>A paged KV cache lets a brand-new prompt and an in-progress generation share the same forward pass.</p>
       </div>
       <div class="feature">
+        <span class="n">03</span>
         <h3>SSE token streaming</h3>
-        <p>Server-Sent Events stream decoded tokens as they're generated, for low-latency client rendering.</p>
+        <p>Decoded text streams to the client the moment each token is sampled — no buffering full sentences.</p>
       </div>
       <div class="feature">
+        <span class="n">04</span>
         <h3>Cancellation &amp; timeouts</h3>
-        <p>Explicit request cancellation, per-request deadlines, and cache-state fallback handling.</p>
+        <p>A disconnected client stops consuming compute mid-generation; deadlines evict requests that overstay.</p>
       </div>
       <div class="feature">
+        <span class="n">05</span>
         <h3>Hot model swap</h3>
-        <p>Swap the loaded model in place via <code>/api/model</code>, draining in-flight requests first — no restart.</p>
+        <p>Swap the loaded model via <code>/api/model</code>, draining in-flight requests first — no restart.</p>
       </div>
       <div class="feature">
+        <span class="n">06</span>
         <h3>Metrics &amp; health</h3>
-        <p>Queue latency, batch size, and token throughput metrics, plus a lightweight FastAPI health check.</p>
+        <p>Queue latency, batch occupancy, and cache utilization, exposed on <code>/api/metrics</code>.</p>
       </div>
     </div>
   </section>
 
   <section id="quick-start">
-    <h2>Quick start</h2>
-    <p>Prerequisites: Python 3.11+, a supported GPU (optional), and access to the Hugging Face Hub for authenticated model downloads.</p>
-    <pre><code>python -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .</code></pre>
-    <p>Run the server for development:</p>
-    <pre><code>python main.py
-# or with uvicorn directly
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload</code></pre>
-    <p>Or, the easier way — the repo's <code>Makefile</code> wraps the full setup in one command: sync dependencies, install the CLI entry point, and start the server.</p>
-    <pre><code>make build-ephemeris</code></pre>
+    <div class="section-head">
+      <h2>Quick start</h2>
+      <p class="eyebrow-label">python 3.12+ · gpu optional</p>
+    </div>
+    <p style="color:var(--text-muted); margin-top:-1rem; margin-bottom:1.5rem;">Prerequisites: Python 3.12+, a supported GPU (optional), and access to the Hugging Face Hub for authenticated model downloads.</p>
+    <div class="quickstart-grid">
+      <div class="code-block">
+        <div class="code-head">One command</div>
+        <pre><span class="c2"># sync deps, install the CLI, start the server</span>
+<span class="c1">$</span> make build-ephemeris</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-head">Plain venv</div>
+        <pre><span class="c1">$</span> python -m venv .venv
+<span class="c1">$</span> source .venv/bin/activate
+<span class="c1">$</span> pip install -e .
+<span class="c1">$</span> python main.py</pre>
+      </div>
+      <div class="code-block">
+        <div class="code-head">Chat with it</div>
+        <pre><span class="c2"># in another terminal</span>
+<span class="c1">$</span> ephemeris-serve start
+<span class="c2">/model, /creativity work mid-session</span></pre>
+      </div>
+      <div class="code-block">
+        <div class="code-head">Pick a model</div>
+        <pre><span class="c1">$</span> ephemeris-serve serve \
+    --model Qwen/Qwen2.5-0.5B</pre>
+      </div>
+    </div>
   </section>
 
   <section id="cli">
-    <h2>CLI chat client</h2>
-    <p><code>ephemeris-serve</code> ships two subcommands: <code>serve</code> starts the inference server, and <code>start</code> is a REPL that talks to an already-running server over <code>/api/generate</code>'s SSE stream.</p>
-    <pre><code># start the server in one terminal
-ephemeris-serve serve
-ephemeris-serve serve --model Qwen/Qwen2.5-0.5B
-
-# chat with it from another terminal
-ephemeris-serve start
-ephemeris-serve start --host 127.0.0.1 --port 8000 --max-tokens 128 --creativity creative</code></pre>
-    <p><code>--creativity</code> picks a friendly sampling-temperature preset (<code>deterministic</code>, <code>balanced</code>, <code>creative</code>, <code>high-freedom</code>); both the model and the creativity level can be changed mid-session with <code>/model</code> and <code>/creativity</code>.</p>
+    <div class="section-head">
+      <h2>CLI chat client</h2>
+      <p class="eyebrow-label">ephemeris-serve start</p>
+    </div>
+    <p style="color:var(--text-muted); margin-top:-1rem; margin-bottom:1.5rem;"><code>ephemeris-serve</code> ships two subcommands: <code>serve</code> starts the inference server, and <code>start</code> is a REPL that talks to an already-running server over <code>/api/generate</code>'s SSE stream. <code>--creativity</code> picks a friendly sampling-temperature preset (<code>deterministic</code>, <code>balanced</code>, <code>creative</code>, <code>high-freedom</code>); both the model and the creativity level can be changed mid-session with <code>/model</code> and <code>/creativity</code>.</p>
     <div class="shots">
       <img src="assets/images/chat-cli1.png" alt="Ephemeris Serve CLI startup splash">
       <img src="assets/images/chat-cli2.png" alt="Ephemeris Serve CLI /model command">
@@ -100,22 +242,65 @@ ephemeris-serve start --host 127.0.0.1 --port 8000 --max-tokens 128 --creativity
   </section>
 
   <section id="learn-more">
-    <h2>Learn more</h2>
-    <p>
-      <a href="api.html">API reference</a> — every endpoint, request/response schema, and a curl example.<br>
-      <a href="https://github.com/SamarjitDebnath/llm-inference-server">GitHub repository</a> — source, issues, and contribution guide.<br>
-      <a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/TECHNICAL_DOCUMENTATION.md">Technical documentation</a> — architecture and internals.<br>
-      <a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/CHANGELOG.md">Changelog</a>
-    </p>
+    <div class="section-head">
+      <h2>Learn more</h2>
+      <p class="eyebrow-label">source &amp; internals</p>
+    </div>
+    <div class="features">
+      <div class="feature">
+        <h3><a href="api.html">API reference</a></h3>
+        <p>Every endpoint, request/response schema, and a curl example.</p>
+      </div>
+      <div class="feature">
+        <h3><a href="https://github.com/SamarjitDebnath/ephemeris-serve/blob/main/TECHNICAL_DOCUMENTATION.md">Technical documentation</a></h3>
+        <p>Architecture, module reference, and known behavior, in depth.</p>
+      </div>
+      <div class="feature">
+        <h3><a href="https://github.com/SamarjitDebnath/ephemeris-serve/blob/main/CHANGELOG.md">Changelog</a></h3>
+        <p>What shipped, what it fixed, and why — every release.</p>
+      </div>
+    </div>
   </section>
 </main>
 
 <footer class="site">
   <div class="wrap">
-    <span>Ephemeris Serve</span>
-    <span><a href="https://github.com/SamarjitDebnath/llm-inference-server/blob/main/LICENSE">License</a></span>
+    <a class="brand" href="./">
+      <svg viewBox="0 0 680 350"><use href="#ephemeris-mark"></use></svg>
+      Ephemeris Serve
+    </a>
+    <div class="links">
+      <a href="https://github.com/SamarjitDebnath/ephemeris-serve">GitHub</a>
+      <a href="https://github.com/SamarjitDebnath/ephemeris-serve/blob/main/LICENSE">License</a>
+      <a href="https://github.com/SamarjitDebnath/ephemeris-serve/blob/main/CHANGELOG.md">Changelog</a>
+    </div>
   </div>
 </footer>
+
+<script>
+  var commands = {
+    make: "make build-ephemeris",
+    uv: "uv sync && uv run python main.py",
+    pip: "pip install -e . && python main.py"
+  };
+  var tabs = document.querySelectorAll(".install-tabs button");
+  var cmdText = document.getElementById("cmd-text");
+  tabs.forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      tabs.forEach(function (b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      cmdText.textContent = commands[btn.dataset.cmd];
+    });
+  });
+  var copyBtn = document.getElementById("copy-btn");
+  copyBtn.addEventListener("click", function () {
+    var text = cmdText.textContent;
+    if (navigator.clipboard) { navigator.clipboard.writeText(text); }
+    var original = copyBtn.textContent;
+    copyBtn.textContent = "COPIED";
+    setTimeout(function () { copyBtn.textContent = original; }, 1200);
+  });
+</script>
 
 </body>
 </html>
