@@ -185,15 +185,30 @@ class ContinuousScheduler:
         if not self.active_requests:
             return None
 
+        return self._build_batch_inputs(self.active_requests)
+
+    def _build_batch_inputs(self, reqs: List[InferenceRequest]) -> Optional[_BatchInputs]:
+        """Build one batched forward-pass input for an explicit request list.
+
+        Factored out of `_prepare_batch` so a persistent whole-batch failure
+        can retry a single request in its own batch of one -- see
+        `_retry_requests_individually`. `_prepare_batch` itself still handles
+        `self.active_requests` (with its cache-validity sweep); this just
+        does the tensor construction, parameterized on whatever subset of
+        requests is passed in.
+        """
+        if not reqs:
+            return None
+
         new_token_tensors = [
             req.input_ids if req.block_table.length == 0 else req.input_ids[:, -1:]
-            for req in self.active_requests
+            for req in reqs
         ]
         new_lengths = [t.shape[1] for t in new_token_tensors]
         max_new_len = max(new_lengths)
 
         keys_per_layer, values_per_layer, past_lengths = self.paged_cache.gather_dense(
-            [req.block_table for req in self.active_requests]
+            [req.block_table for req in reqs]
         )
         past_width = max(past_lengths) if past_lengths else 0
 
@@ -265,12 +280,16 @@ class ContinuousScheduler:
             new_lengths=new_lengths,
         )
 
-    async def _dispatch_tokens(self, next_tokens, new_past, past_width: int, new_lengths: List[int]):
+    async def _dispatch_tokens(self, reqs: List[InferenceRequest], next_tokens, new_past, past_width: int, new_lengths: List[int]):
         """Stream sampled tokens back to clients and update per-request state.
 
         Args:
+            reqs: The requests this step's batch was built from, index-aligned
+                with ``next_tokens``/``new_past``/``new_lengths`` -- normally
+                ``self.active_requests``, but may be a single-request subset
+                during isolation retries (see `_retry_requests_individually`).
             next_tokens: Tensor of shape ``(batch, 1)`` with one token per
-                active request.
+                request in ``reqs``.
             new_past: The full batched ``past_key_values`` returned by the
                 model's forward pass, width ``past_width + max(new_lengths)``.
             past_width: The shared past-region width fed into this step
@@ -279,9 +298,9 @@ class ContinuousScheduler:
                 step (``_BatchInputs.new_lengths``) -- a row's whole prompt
                 on its first step, or 1 while mid-decode.
         """
-        logger.debug("Dispatching %d tokens to active requests", len(self.active_requests))
+        logger.debug("Dispatching %d tokens", len(reqs))
         finished_requests = []
-        for idx, req in enumerate(self.active_requests):
+        for idx, req in enumerate(reqs):
             token_id = next_tokens[idx].item()
 
             # Stream token back to the client if the queue is configured
@@ -405,22 +424,22 @@ class ContinuousScheduler:
             req.queue.put_nowait(("[ERROR]", "generation timed out"))
         self._free_block_table(req)
 
-    def _fail_active_batch(self, exc: Exception) -> None:
-        """Fail every active request after an unrecoverable generation-step error.
+    def _fail_single_request(self, req: InferenceRequest, exc: Exception) -> None:
+        """Fail exactly one request after an unrecoverable generation-step error.
 
         `exc` itself (which may contain internal detail -- stack-trace-flavored
         text, memory sizes, file paths, ...) is kept on the request's `future`
         for internal bookkeeping only. The client-facing SSE message is always
         the generic `INTERNAL_ERROR_MESSAGE`; full detail is already logged
-        server-side by the caller (`_step()`) before this runs.
+        server-side by the caller. Used by `_retry_requests_individually` for
+        a request that fails even in its own batch of one; callers are
+        responsible for removing `req` from `self.active_requests` themselves.
         """
-        for req in self.active_requests:
-            if not req.future.done():
-                req.future.set_exception(exc)
-            if getattr(req, "queue", None) is not None:
-                req.queue.put_nowait(("[ERROR]", INTERNAL_ERROR_MESSAGE))
-            self._free_block_table(req)
-        self.active_requests = []
+        if not req.future.done():
+            req.future.set_exception(exc)
+        if getattr(req, "queue", None) is not None:
+            req.queue.put_nowait(("[ERROR]", INTERNAL_ERROR_MESSAGE))
+        self._free_block_table(req)
 
     def _evict_cancelled_requests(self) -> None:
         """Drop requests whose client has already disconnected.
@@ -465,8 +484,13 @@ class ContinuousScheduler:
                 still_active.append(req)
         self.active_requests = still_active
 
-    def _forward_and_sample(self, batch_inputs: _BatchInputs):
-        """Run the forward pass, repetition penalty, and per-request sampling."""
+    def _forward_and_sample(self, batch_inputs: _BatchInputs, reqs: List[InferenceRequest]):
+        """Run the forward pass, repetition penalty, and per-request sampling.
+
+        `reqs` must be index-aligned with `batch_inputs`'s rows -- normally
+        `self.active_requests`, but may be a single-request subset during
+        isolation retries (see `_retry_requests_individually`).
+        """
         logits, new_past = self.engine.forward_step(
             batch_inputs.input_ids,
             batch_inputs.attention_mask,
@@ -482,7 +506,7 @@ class ContinuousScheduler:
         # penalize. Each request's real length differs (mixed prefill/decode,
         # different prompt lengths), so this is a ragged list, not a dense
         # tensor -- `apply_repetition_penalty` accepts either.
-        full_histories = [req.input_ids[0] for req in self.active_requests]
+        full_histories = [req.input_ids[0] for req in reqs]
         logits = self.engine.apply_repetition_penalty(logits, full_histories)
         next_tokens = torch.stack([
             self.engine.sample(
@@ -491,9 +515,44 @@ class ContinuousScheduler:
                 model_settings.top_k,
                 model_settings.top_p,
             )
-            for i, req in enumerate(self.active_requests)
+            for i, req in enumerate(reqs)
         ])
         return next_tokens, new_past
+
+    async def _retry_requests_individually(self) -> None:
+        """Isolate a persistent whole-batch failure to whichever request(s) cause it.
+
+        Called after two whole-batch failures in a row (see `_step`). A
+        batched forward pass fails or succeeds as a unit, so at that point
+        there's no way to attribute the failure to one row from the exception
+        alone. Retry every currently-active request in its own batch of
+        one: whichever succeed are dispatched normally, same as any other
+        step; whichever fail again are failed individually via
+        `_fail_single_request` instead of taking every co-batched request
+        down with them.
+        """
+        for req in list(self.active_requests):
+            if req not in self.active_requests:
+                # Removed by a `_dispatch_tokens` finish or an earlier
+                # iteration's failure this loop.
+                continue
+            single_batch = self._build_batch_inputs([req])
+            if single_batch is None:
+                continue
+            try:
+                next_tokens, new_past = self._forward_and_sample(single_batch, [req])
+            except Exception as solo_exc:
+                logger.exception(
+                    "Request failed even in isolation after batch retry failed twice; "
+                    "failing it alone: prompt=%s error=%s",
+                    req.prompt,
+                    solo_exc,
+                )
+                self._fail_single_request(req, solo_exc)
+                self.active_requests = [r for r in self.active_requests if r is not req]
+                empty_device_cache(self.engine.device)
+                continue
+            await self._dispatch_tokens([req], next_tokens, new_past, single_batch.past_width, single_batch.new_lengths)
 
     async def _step(self):
         """Run a single token generation step for *all* active requests.
@@ -519,27 +578,38 @@ class ContinuousScheduler:
             return
 
         # 2-4. Forward pass, repetition penalty, sampling (engine concern).
-        # Retried once on transient failure before failing the whole batch --
-        # a batched forward pass fails or succeeds as a unit, so there's no
-        # per-request granularity to retry at. The retry is only likely to
-        # help for an OOM-shaped failure, so free whatever cached-but-unused
-        # device memory PyTorch's allocator is holding onto first -- retrying
-        # against the exact same memory state that just failed would almost
-        # certainly fail again.
+        # Retried once on transient failure before falling back to
+        # per-request isolation -- a batched forward pass fails or succeeds
+        # as a unit, so there's no per-request granularity to retry at here.
+        # The retry is only likely to help for an OOM-shaped failure, so free
+        # whatever cached-but-unused device memory PyTorch's allocator is
+        # holding onto first -- retrying against the exact same memory state
+        # that just failed would almost certainly fail again.
         try:
-            next_tokens, new_past = self._forward_and_sample(batch_inputs)
+            next_tokens, new_past = self._forward_and_sample(batch_inputs, self.active_requests)
         except Exception as exc:
             logger.warning("Generation step failed, retrying once: %s", exc)
             empty_device_cache(self.engine.device)
             try:
-                next_tokens, new_past = self._forward_and_sample(batch_inputs)
+                next_tokens, new_past = self._forward_and_sample(batch_inputs, self.active_requests)
             except Exception as exc2:
-                logger.exception("Generation step failed again after retry; failing active batch: %s", exc2)
-                self._fail_active_batch(exc2)
-                return
+                # Two whole-batch failures in a row: the failure may be
+                # specific to one poisoned request (bad cached state, a
+                # degenerate shape, ...) rather than every co-batched
+                # request. Retry each active request in its own batch of one
+                # instead of failing everyone -- see
+                # `_retry_requests_individually`.
+                logger.exception(
+                    "Generation step failed again after retry; isolating requests one at a time: %s", exc2
+                )
+                await self._retry_requests_individually()
+                next_tokens = None
 
-        # 5. Dispatch tokens and update request state (scheduler concern)
-        await self._dispatch_tokens(next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths)
+        # 5. Dispatch tokens and update request state (scheduler concern).
+        # Skipped if isolation already handled dispatch above (`next_tokens`
+        # stays `None` in that branch).
+        if next_tokens is not None:
+            await self._dispatch_tokens(self.active_requests, next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths)
 
         # The paged cache's pool never shrinks, but PyTorch's own device
         # allocator caches freed tensor memory rather than returning it to

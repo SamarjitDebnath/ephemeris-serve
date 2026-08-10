@@ -440,7 +440,7 @@ class TestRepetitionPenalty:
             logit_gather_indices=torch.tensor([0]),
         )
 
-        scheduler._forward_and_sample(batch_inputs)
+        scheduler._forward_and_sample(batch_inputs, scheduler.active_requests)
 
         mock_engine.apply_repetition_penalty.assert_called_once()
         _, passed_input_ids = mock_engine.apply_repetition_penalty.call_args[0]
@@ -552,7 +552,7 @@ class TestContinuousSchedulerDeviceCache:
 
         call_count = 0
 
-        def fake_forward_and_sample(batch_inputs):
+        def fake_forward_and_sample(batch_inputs, reqs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -615,7 +615,7 @@ class TestContinuousSchedulerDeviceCache:
         mock_maybe_clear.assert_called_with("cpu")
         mock_empty_cache.assert_not_called()  # unconditional clear is only for the idle/retry paths
 
-    def test_fail_active_batch_sends_generic_message_not_raw_exception_text(self):
+    def test_fail_single_request_sends_generic_message_not_raw_exception_text(self):
         """The client-facing SSE error must never contain internal exception
         detail (stack-trace-flavored text, memory sizes, ...) -- only the
         generic INTERNAL_ERROR_MESSAGE. The real exception still goes onto the
@@ -638,14 +638,73 @@ class TestContinuousSchedulerDeviceCache:
         )
         scheduler.active_requests = [req]
 
-        scheduler._fail_active_batch(sensitive_exc)
+        scheduler._fail_single_request(req, sensitive_exc)
 
         assert req.future.exception() is sensitive_exc
         sentinel_type, message = req.queue.get_nowait()
         assert sentinel_type == "[ERROR]"
         assert message == INTERNAL_ERROR_MESSAGE
         assert "MPS" not in message and "GiB" not in message
-        assert scheduler.active_requests == []
+
+    @pytest.mark.asyncio
+    async def test_step_isolates_bad_request_instead_of_failing_whole_batch(self):
+        """Regression test for whole-batch retry granularity: if the batch
+        forward pass fails twice in a row, the scheduler must retry each
+        active request in its own batch of one -- a request that still fails
+        alone is failed individually, but co-batched requests that succeed
+        alone must still complete normally instead of being failed alongside
+        it."""
+        try:
+            from scheduler.continuous_scheduler import ContinuousScheduler
+            from scheduler.request import InferenceRequest
+        except ImportError:
+            pytest.skip("Required modules not available")
+
+        mock_engine = Mock()
+        mock_engine.device = "cpu"
+        scheduler = ContinuousScheduler(mock_engine, Mock(), max_batch_size=2, timeout=0.01)
+
+        good_req = InferenceRequest(prompt="good", max_tokens=5, temperature=0.0)
+        good_req.input_ids = torch.tensor([[1, 2]])
+        bad_req = InferenceRequest(prompt="bad", max_tokens=5, temperature=0.0)
+        bad_req.input_ids = torch.tensor([[3, 4]])
+        scheduler.active_requests = [good_req, bad_req]
+
+        scheduler._prepare_batch = Mock(return_value=Mock(past_width=0, new_lengths=[1, 1]))
+
+        def fake_build_batch_inputs(reqs):
+            return Mock(past_width=0, new_lengths=[1] * len(reqs))
+
+        scheduler._build_batch_inputs = fake_build_batch_inputs
+
+        call_count = 0
+
+        def fake_forward_and_sample(batch_inputs, reqs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                # The two whole-batch attempts (initial + retry) both fail.
+                raise RuntimeError("simulated failure")
+            # Isolation retries: one request per call, in list order.
+            if reqs[0] is bad_req:
+                raise RuntimeError("simulated failure, persists in isolation")
+            return torch.tensor([[9]]), None
+
+        scheduler._forward_and_sample = fake_forward_and_sample
+
+        dispatched = []
+
+        async def fake_dispatch(reqs, next_tokens, new_past, past_width, new_lengths):
+            dispatched.extend(reqs)
+
+        scheduler._dispatch_tokens = fake_dispatch
+
+        with patch("scheduler.continuous_scheduler.empty_device_cache"):
+            await scheduler._step()
+
+        assert dispatched == [good_req], "The good request should still be dispatched normally"
+        assert bad_req.future.exception() is not None, "The bad request should be failed"
+        assert bad_req not in scheduler.active_requests, "The bad request should be removed from the active pool"
 
 
 class TestModelSwapDeviceCleanup:
@@ -890,7 +949,9 @@ def _run_scheduler_step(scheduler, engine):
     )
     next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
     asyncio.run(
-        scheduler._dispatch_tokens(next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths)
+        scheduler._dispatch_tokens(
+            scheduler.active_requests, next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths
+        )
     )
     return next_tokens
 
@@ -982,7 +1043,9 @@ class TestTokenizerService:
             )
             next_tokens = torch.tensor([[non_eos_token]], dtype=torch.long, device=engine.device)
             asyncio.run(
-                scheduler._dispatch_tokens(next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths)
+                scheduler._dispatch_tokens(
+                    scheduler.active_requests, next_tokens, new_past, batch_inputs.past_width, batch_inputs.new_lengths
+                )
             )
 
         assert request.block_table.length > 0, "Expected request KV cache to be populated after the first step"
