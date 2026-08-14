@@ -26,7 +26,7 @@ with a paged KV cache, SSE token streaming, runtime model hot-swap, and a
 
 This repository implements a lightweight FastAPI-based inference server for autoregressive language models using the Hugging Face `transformers` ecosystem.
 
-The system is architected around a continuous token scheduler that batches prompt requests, reuses a per-request slice of a shared paged KV cache, and streams decoded text back to the client through SSE. A separate `click`-based CLI (`cli/main.py`) can both launch the server and act as a REPL chat client against it.
+The system is architected around a continuous token scheduler that batches prompt requests, reuses a per-request slice of a shared paged KV cache, and streams decoded text back to the client through SSE. A separate distribution (`packages/ephemeris-cli`, the `ephemeris` command) provides a `click`-based REPL chat client that speaks HTTP to a running server and installs without the server's dependencies.
 
 Key capabilities:
 - HTTP endpoint `/api/generate` for streaming, prompt-based generation

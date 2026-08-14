@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "High-performance LLM inference server with continuous scheduling and dynamic batching"
 readme = "README.md"
 requires-python = ">=3.12"
+# Server dependencies only. The chat client is a separate distribution
+# (packages/ephemeris-cli) with its own thin dependency set -- nothing here is
+# needed to talk to a running server.
 dependencies = [
     "fastapi>=0.135.1",
     "pydantic-settings>=2.14.2",
@@ -24,7 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ephemeris-serve = "cli.main:cli"
+ephemeris-serve = "api.cli:cli"
 
 [project.optional-dependencies]
 dev = [
@@ -41,7 +44,6 @@ dev = [
 [tool.setuptools]
 packages = [
     "api",
-    "cli",
     "engine",
     "logger",
     "scheduler",

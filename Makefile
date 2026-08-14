@@ -1,4 +1,4 @@
-.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs build-ephemeris wiki-sync
+.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs build-ephemeris wiki-sync smoke-nginx
 
 help:
 	@echo "LLM Inference Server - Available Commands"
@@ -10,13 +10,14 @@ help:
 	@echo ""
 	@echo "Running:"
 	@echo "  make run          - Run the server (development mode)"
-	@echo "  make run-prod     - Run the server (production mode)"
+	@echo "  make run-prod     - Run the server on loopback for the nginx proxy"
 	@echo "  make build-ephemeris - E2E: sync deps, install the CLI, start the server"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test-unit    - Run unit tests"
 	@echo "  make test-latency - Run latency benchmarks"
 	@echo "  make test-all     - Run all tests"
+	@echo "  make smoke-nginx  - Verify the nginx reverse-proxy config (needs nginx)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make format       - Format code with black & isort"
@@ -41,12 +42,13 @@ run:
 	uv run python main.py
 
 run-prod:
-	uv run python -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+	uv run python -m uvicorn main:app --host 127.0.0.1 --port 8000 --workers 4 \
+		--proxy-headers --forwarded-allow-ips 127.0.0.1
 
 build-ephemeris:
 	@echo "==> [1/2] Installing Ephemeris Serve and dependencies (uv sync)"
 	uv sync
-	@echo "==> [2/2] Starting the server -- once it's up, run 'ephemeris-serve start' in another terminal to chat"
+	@echo "==> [2/2] Starting the server -- once it's up, run 'ephemeris start' in another terminal to chat"
 	uv run python main.py
 
 test-unit:
@@ -75,6 +77,9 @@ logs:
 
 wiki-sync:
 	bash scripts/sync_wiki.sh
+
+smoke-nginx:
+	bash deploy/smoke/smoke_test.sh
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

@@ -2,6 +2,7 @@ import os
 
 import torch
 from utils.utils import *
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -29,11 +30,17 @@ class ModelSetting:
     def __init__(self, config_path: str = "settings/config.yaml"):
         config = Utils.load_config(config_path)["model_config"]["defaults"]
 
-        # EPHEMERIS_MODEL_NAME lets a caller (e.g. `ephemeris-serve serve --model`)
-        # pick the model for this run without editing config.yaml -- read via env
-        # var, not an in-process singleton mutation, so it survives uvicorn
-        # spawning fresh worker processes that re-import settings from scratch.
-        self.model_name = os.environ.get("EPHEMERIS_MODEL_NAME") or config["model_name"]
+        # EPHEMERIS_SERVER_MODEL_NAME lets a caller (e.g. `ephemeris-serve serve
+        # --model`) pick the model for this run without editing config.yaml --
+        # read via env var, not an in-process singleton mutation, so it survives
+        # uvicorn spawning fresh worker processes that re-import settings from
+        # scratch. EPHEMERIS_MODEL_NAME is the older unscoped spelling, still
+        # honored so existing deployments keep working.
+        self.model_name = (
+            os.environ.get("EPHEMERIS_SERVER_MODEL_NAME")
+            or os.environ.get("EPHEMERIS_MODEL_NAME")
+            or config["model_name"]
+        )
         self.device = resolve_device(config["device"])
         self.max_length = config["max_length"]
         self.temperature = config["temperature"]
@@ -71,9 +78,36 @@ class CacheSetting:
 class SecretSetting(BaseSettings):
     hf_key: str | None = ""
 
+    # Comma-separated API keys accepted by the /api routes (see api/auth.py).
+    # Both empty means authentication is disabled and every route is open --
+    # fine for local development, never for a deployment reachable from
+    # outside localhost. Admin keys additionally authorize POST /api/model.
+    #
+    # Every variable this server owns is prefixed EPHEMERIS_SERVER_. The chat
+    # client is a separate distribution (packages/ephemeris-cli) and owns the
+    # EPHEMERIS_CLIENT_ prefix, so the two never collide on a host running
+    # both. The older unscoped spellings are still accepted, listed second so
+    # the scoped name wins when both are set; bare API_KEYS/ADMIN_API_KEYS are
+    # deliberately *not* accepted -- too generic a name to claim from the
+    # process environment.
+    api_keys: str | None = Field(
+        default="",
+        validation_alias=AliasChoices("EPHEMERIS_SERVER_API_KEYS", "EPHEMERIS_API_KEYS"),
+    )
+    admin_api_keys: str | None = Field(
+        default="",
+        validation_alias=AliasChoices("EPHEMERIS_SERVER_ADMIN_API_KEYS", "EPHEMERIS_ADMIN_API_KEYS"),
+    )
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
+        # pydantic-settings validates every key it finds in .env against this
+        # model, and its default is to reject unknown ones -- which turns any
+        # unrelated entry in .env (or in a deployment's EnvironmentFile) into
+        # a ValidationError at import time, taking the whole server down
+        # before it logs anything useful. Ignore what this model doesn't own.
+        "extra": "ignore",
     }
 
 model_settings = ModelSetting()

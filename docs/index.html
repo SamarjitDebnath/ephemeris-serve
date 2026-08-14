@@ -177,7 +177,7 @@
   <section id="features">
     <div class="section-head">
       <h2>What the scheduler actually does</h2>
-      <p class="eyebrow-label">six things, working together</p>
+      <p class="eyebrow-label">eight things, working together</p>
     </div>
     <div class="features">
       <div class="feature">
@@ -210,6 +210,14 @@
         <h3>Metrics &amp; health</h3>
         <p>Queue latency, batch occupancy, and cache utilization, exposed on <code>/api/metrics</code>.</p>
       </div>
+      <div class="feature">
+        <h3>API-key auth</h3>
+        <p>Two tiers of bearer key: an ordinary tier for generation and read-only routes, and a separate admin tier for the one route that loads an arbitrary model. Constant-time comparison, keys never logged.</p>
+      </div>
+      <div class="feature">
+        <h3>Production deployment</h3>
+        <p>An nginx reverse proxy config (TLS, rate limits, SSE-safe buffering) and a systemd unit ship in <code>deploy/</code>, with a walkthrough covering keys, supervision, and pointing clients at the result.</p>
+      </div>
     </div>
   </section>
 
@@ -234,9 +242,9 @@
       </div>
       <div class="code-block">
         <div class="code-head">Chat with it</div>
-        <pre><span class="c2"># in another terminal</span>
-<span class="c1">$</span> ephemeris-serve start
-<span class="c2">/model, /creativity work mid-session</span></pre>
+        <pre><span class="c2"># anywhere &mdash; no torch needed</span>
+<span class="c1">$</span> pip install ephemeris-cli
+<span class="c1">$</span> ephemeris start</pre>
       </div>
       <div class="code-block">
         <div class="code-head">Pick a model</div>
@@ -249,9 +257,9 @@
   <section id="cli">
     <div class="section-head">
       <h2>CLI chat client</h2>
-      <p class="eyebrow-label">ephemeris-serve start</p>
+      <p class="eyebrow-label">ephemeris start</p>
     </div>
-    <p style="color:var(--text-muted); margin-top:-1rem; margin-bottom:1.5rem;"><code>ephemeris-serve</code> ships two subcommands: <code>serve</code> starts the inference server, and <code>start</code> is a REPL that talks to an already-running server over <code>/api/generate</code>'s SSE stream. <code>--creativity</code> picks a friendly sampling-temperature preset (<code>deterministic</code>, <code>balanced</code>, <code>creative</code>, <code>high-freedom</code>); both the model and the creativity level can be changed mid-session with <code>/model</code> and <code>/creativity</code>.</p>
+    <p style="color:var(--text-muted); margin-top:-1rem; margin-bottom:1.5rem;">The client ships as its own distribution, <code>ephemeris-cli</code>, depending only on <code>click</code>, <code>httpx</code> and <code>pyyaml</code> &mdash; install it on a laptop to talk to a remote server without pulling torch or transformers. <code>ephemeris start</code> is a REPL over <code>/api/generate</code>'s SSE stream; the server itself is started by the separate <code>ephemeris-serve</code> command. <code>--creativity</code> picks a friendly sampling-temperature preset (<code>deterministic</code>, <code>balanced</code>, <code>creative</code>, <code>high-freedom</code>); both the model and the creativity level can be changed mid-session with <code>/model</code> and <code>/creativity</code>.</p>
     <div class="shots">
       <img src="assets/images/chat-cli1.png" alt="Ephemeris Serve CLI startup splash">
       <img src="assets/images/chat-cli2.png" alt="Ephemeris Serve CLI /model command">
@@ -272,6 +280,10 @@
       <div class="feature">
         <h3><a href="https://github.com/SamarjitDebnath/ephemeris-serve/wiki">Technical documentation</a></h3>
         <p>Architecture, module reference, and known behavior, in depth.</p>
+      </div>
+      <div class="feature">
+        <h3><a href="https://github.com/SamarjitDebnath/ephemeris-serve/blob/main/deploy/README.md">Deployment guide</a></h3>
+        <p>systemd, API keys, nginx with TLS, then pointing clients at it.</p>
       </div>
       <div class="feature">
         <h3><a href="https://github.com/SamarjitDebnath/ephemeris-serve/blob/main/CHANGELOG.md">Changelog</a></h3>

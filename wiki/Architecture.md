@@ -45,7 +45,7 @@ flowchart TD
 
     subgraph clientry[CLI entrypoints]
         SERVECMD["ephemeris-serve serve [--model]"] -.->|uvicorn.run| SRV
-        STARTCMD[ephemeris-serve start - REPL] -.->|HTTP| GEN
+        STARTCMD[ephemeris - REPL] -.->|HTTP| GEN
         STARTCMD -.->|/model command| MODELAPI
     end
 ```
@@ -66,7 +66,7 @@ Implementation details:
 - `workers=1` is explicitly chosen for development and to avoid model loading overhead on multiple workers.
 - `reload=True` enables auto-reload on source changes and should be disabled in production.
 
-### `ephemeris-serve serve` (`cli/main.py`)
+### `ephemeris-serve serve` (`api/cli.py`)
 
 An alternative entrypoint to `main.py`, installed via the `[project.scripts]` entry point. Runs the same `api.server:app`, but exposes `--host`, `--port`, `--workers`, `--reload`, and (unlike `main.py`) `--model` as CLI flags instead of hardcoded values. See [CLI Layer](CLI-and-Configuration#cli-layer) below.
 

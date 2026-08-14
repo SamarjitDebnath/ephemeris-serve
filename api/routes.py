@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 from schemas.schemas import (
     BatchGenerateRequest,
@@ -9,6 +9,7 @@ from schemas.schemas import (
     ModelSwapRequest,
     ModelSwapResponse,
 )
+from api.auth import require_admin_api_key, require_api_key
 from scheduler.request import InferenceRequest
 from scheduler.idempotency import idempotency_store
 from streaming.stream_manager import stream_response
@@ -48,7 +49,7 @@ async def _replay_result(result: str):
     yield result
 
 
-@router.post("/generate")
+@router.post("/generate", dependencies=[Depends(require_api_key)])
 async def generate(req: GenerateRequest, request: Request):
     if swap_lock.locked():
         raise HTTPException(status_code=503, detail="Model swap in progress; try again shortly.")
@@ -115,7 +116,11 @@ async def generate(req: GenerateRequest, request: Request):
     )
 
 
-@router.post("/generate_batch", response_model=BatchGenerateResponse)
+@router.post(
+    "/generate_batch",
+    response_model=BatchGenerateResponse,
+    dependencies=[Depends(require_api_key)],
+)
 async def generate_batch(batch_req: BatchGenerateRequest, request: Request):
     if swap_lock.locked():
         raise HTTPException(status_code=503, detail="Model swap in progress; try again shortly.")
@@ -177,12 +182,20 @@ async def generate_batch(batch_req: BatchGenerateRequest, request: Request):
     )
 
 
-@router.get("/model", response_model=ModelSwapResponse)
+@router.get(
+    "/model",
+    response_model=ModelSwapResponse,
+    dependencies=[Depends(require_api_key)],
+)
 async def current_model():
     return ModelSwapResponse(model_name=model_settings.model_name)
 
 
-@router.post("/model", response_model=ModelSwapResponse)
+@router.post(
+    "/model",
+    response_model=ModelSwapResponse,
+    dependencies=[Depends(require_admin_api_key)],
+)
 async def switch_model(swap_req: ModelSwapRequest, request: Request):
     """Hot-swap the model this server is running, without a process restart.
 
@@ -213,6 +226,6 @@ async def switch_model(swap_req: ModelSwapRequest, request: Request):
     return ModelSwapResponse(model_name=new_name)
 
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[Depends(require_api_key)])
 async def metrics_endpoint():
     return {"batch": metrics.snapshot(), "streaming": streaming_metrics.snapshot()}

@@ -45,6 +45,26 @@ Notes:
 - All request and lifecycle logs are written using the configured logger.
 - Startup and shutdown are tied to FastAPI's lifespan, ensuring model and scheduler lifecycle are managed automatically.
 
+### `api/auth.py`
+
+API-key authentication for the `/api` routes, applied as FastAPI dependencies rather than middleware, so the protected surface is visible in each route decorator.
+
+Two tiers, both comma-separated lists read from the environment via `SecretSetting` (`settings/settings.py`, accepting `EPHEMERIS_SERVER_API_KEYS`/`EPHEMERIS_SERVER_ADMIN_API_KEYS` or the unprefixed names):
+- `api_keys()` -- ordinary access: `/generate`, `/generate_batch`, `GET /model`, `/metrics`. Admin keys are concatenated in, so an admin key works everywhere.
+- `admin_api_keys()` -- additionally authorizes `POST /model`, the one route that makes the server download and load an arbitrary Hugging Face repo (disk exhaustion, OOM, or a drain-and-reload stall are all reachable from it).
+
+`auth_enabled()`: true once any key is configured. **With no keys configured every route is open** -- deliberate, so `make run` and the test suite need no setup -- and `api/server.py`'s lifespan logs a prominent warning in that state. It also warns when ordinary keys exist but no admin key does, since `POST /model` then rejects everything.
+
+`_extract_bearer(authorization)`: parses `Authorization: Bearer <token>`; any other scheme, or an empty token, yields `None`.
+
+`_matches(candidate, allowed)`: `hmac.compare_digest` against every entry, and deliberately does **not** short-circuit on the first match -- constant-time comparison stops response timing from leaking how much of a key was correct, and comparing every entry keeps the comparison count independent of which key matched.
+
+`require_api_key(authorization)`: dependency raising `401` for a missing (`_MISSING_KEY_MESSAGE`) or unrecognized (`_INVALID_KEY_MESSAGE`) key; returns the presented key so `require_admin_api_key` can depend on it rather than re-reading the header. A rejected key is logged **without its value** -- a mistyped key is often a real key from another environment.
+
+`require_admin_api_key(token)`: `403` if the presented key isn't in the admin list, and also `403` when ordinary keys exist but no admin key is configured -- refusing rather than silently letting every key swap the model.
+
+`/health` and `/` live on the app, not the router, so they stay unauthenticated for proxy health checks and uptime monitors.
+
 ### `api/routes.py`
 
 This module implements the public inference endpoints.

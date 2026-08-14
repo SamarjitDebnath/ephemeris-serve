@@ -85,7 +85,23 @@
 <main>
   <section style="padding-top: 3rem;">
     <h2 style="margin-bottom:0.4rem;">API Reference</h2>
-    <p style="color:var(--text-muted); margin-top:0;">Base URL: <code>http://&lt;host&gt;:8000</code>. Routes under <code>/api</code> are mounted from <code>api/routes.py</code>; <code>/</code> and <code>/health</code> are top-level.</p>
+    <p style="color:var(--text-muted); margin-top:0;">Base URL: <code>http://&lt;host&gt;:8000</code> direct, or <code>http://&lt;host&gt;:8080</code> through the bundled nginx reverse proxy. Routes under <code>/api</code> are mounted from <code>api/routes.py</code>; <code>/</code> and <code>/health</code> are top-level.</p>
+  </section>
+
+  <section>
+    <div class="endpoint">
+      <h3>Authentication</h3>
+      <p class="desc">Every <code>/api</code> route takes an API key as <code>Authorization: Bearer &lt;key&gt;</code>, in two tiers. <code>/</code> and <code>/health</code> never require one.</p>
+      <table>
+        <tr><th>Tier</th><th>Server environment variable</th><th>Covers</th></tr>
+        <tr><td>Ordinary</td><td><code>EPHEMERIS_SERVER_API_KEYS</code></td><td><code>/api/generate</code>, <code>/api/generate_batch</code>, <code>GET /api/model</code>, <code>/api/metrics</code></td></tr>
+        <tr><td>Admin</td><td><code>EPHEMERIS_SERVER_ADMIN_API_KEYS</code></td><td>additionally <code>POST /api/model</code></td></tr>
+      </table>
+      <p class="desc" style="margin-top:1rem;">Both hold a comma-separated list, so keys rotate by adding the new one before removing the old. <code>POST /api/model</code> is gated separately because it makes the server download and load an arbitrary Hugging Face repo. A missing or unrecognized key returns <code>401</code>; an ordinary key on the admin route returns <code>403</code>.</p>
+      <p class="desc"><strong>With no keys configured every route is open</strong> &mdash; the local-development default. Any server reachable from outside localhost must set at least the ordinary tier.</p>
+      <pre><code>curl -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
+  http://localhost:8000/api/metrics</code></pre>
+    </div>
   </section>
 
   <section>
@@ -119,6 +135,7 @@
       <p style="margin-top:1rem;"><strong>Example</strong></p>
       <pre><code>curl -N -H "Accept: text/event-stream" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
   -X POST \
   -d '{"prompt":"Hello world","max_tokens":50,"temperature":0.7}' \
   http://localhost:8000/api/generate</code></pre>
@@ -142,6 +159,7 @@
       </table>
       <p style="margin-top:1rem;"><strong>Example</strong></p>
       <pre><code>curl -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
   -X POST \
   -d '{"requests": [{"prompt": "Hello world", "max_tokens": 50, "temperature": 0.7}]}' \
   http://localhost:8000/api/generate_batch</code></pre>
@@ -167,6 +185,7 @@
       </table>
       <p style="margin-top:1rem;"><strong>Example</strong></p>
       <pre><code>curl -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
   -X POST \
   -d '{"model_name": "Qwen/Qwen2.5-0.5B"}' \
   http://localhost:8000/api/model</code></pre>
@@ -181,7 +200,8 @@
         <tr><td><code>streaming</code></td><td>object</td><td>Snapshot of streaming-inference metrics.</td></tr>
       </table>
       <p style="margin-top:1rem;"><strong>Example</strong></p>
-      <pre><code>curl http://localhost:8000/api/metrics</code></pre>
+      <pre><code>curl -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
+  http://localhost:8000/api/metrics</code></pre>
     </div>
 
   </section>

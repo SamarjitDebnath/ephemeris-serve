@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ephemeris-cli"
+version = "0.1.0"
+description = "Chat client for an Ephemeris Serve inference server"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Deliberately thin: this is an HTTP client. It must never depend on torch,
+# transformers, fastapi or uvicorn -- installing it on a laptop to talk to a
+# remote server should not pull the server's multi-gigabyte stack.
+dependencies = [
+    "click>=8.4.1",
+    "httpx>=0.28.1",
+    "pyyaml>=6.0.3",
+    # macOS links Python's readline against BSD libedit, which cannot both
+    # colour the REPL prompt and count its width correctly -- see the import
+    # comment in ephemeris_cli/main.py. Linux already ships GNU readline.
+    "gnureadline>=8.2.0 ; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+ephemeris = "ephemeris_cli.main:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+]
+
+[tool.setuptools]
+packages = ["ephemeris_cli"]
+
+[tool.setuptools.package-data]
+ephemeris_cli = ["*.yaml"]

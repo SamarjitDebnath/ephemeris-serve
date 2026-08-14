@@ -49,6 +49,8 @@ dmypy.json
 
 # Environment variables
 .env
+# the client distribution keeps its own, separate from the server's
+packages/ephemeris-cli/.env
 .env.*
 !.env.example
 

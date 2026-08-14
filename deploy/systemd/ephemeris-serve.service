@@ -1,0 +1,86 @@
+[Unit]
+Description=Ephemeris Serve inference server
+Documentation=https://github.com/SamarjitDebnath/ephemeris-serve/wiki
+# Model weights are downloaded from the Hugging Face Hub on first start, so
+# the unit must not come up before the network is actually usable.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ephemeris
+Group=ephemeris
+
+# WorkingDirectory is load-bearing, not cosmetic: settings/settings.py reads
+# "settings/config.yaml" and the logger writes "logs/app.log", both relative
+# paths. Started from anywhere else, the server fails to find its config.
+WorkingDirectory=/opt/ephemeris-serve
+
+# Credentials and API keys. Keep this file out of the repo, owned by root,
+# mode 0600: it holds HF_KEY and the API keys that authorize model swaps.
+#   HF_KEY=hf_...
+#   EPHEMERIS_SERVER_API_KEYS=key-one,key-two
+#   EPHEMERIS_SERVER_ADMIN_API_KEYS=admin-key
+EnvironmentFile=/etc/ephemeris-serve/env
+
+# Where Hugging Face caches downloaded weights. Set explicitly so the cache
+# lands on real storage rather than in a home directory this user may not have.
+Environment=HF_HOME=/var/lib/ephemeris-serve/huggingface
+
+# Bind loopback only: nginx (deploy/nginx) is the public listener, and the
+# --proxy-headers trust below is only safe while nothing else can reach this
+# port directly.
+ExecStart=/opt/ephemeris-serve/.venv/bin/python -m uvicorn api.server:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips 127.0.0.1
+
+# Model load (potentially a multi-GB download on first boot) happens during
+# FastAPI's lifespan startup, before the socket accepts traffic. systemd must
+# not mistake that for a hang.
+TimeoutStartSec=900
+
+# Draining in-flight generation plus releasing device memory takes longer than
+# the 90s default, and a SIGKILL mid-swap can leave a partial model cache.
+TimeoutStopSec=120
+
+Restart=always
+RestartSec=5
+
+# Cap restart looping: if it fails 5 times in 10 minutes, stop and stay stopped
+# so a bad config surfaces as a failed unit rather than an endless crash loop.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ephemeris-serve
+
+# ---- Hardening ------------------------------------------------------------
+# The process needs to read its install directory, write logs and the model
+# cache, and reach the network. Nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# The only writable paths. logs/ sits under WorkingDirectory because the log
+# path in settings/config.yaml is relative to it.
+ReadWritePaths=/var/lib/ephemeris-serve /opt/ephemeris-serve/logs
+
+# NOTE: MemoryDenyWriteExecute is deliberately NOT set -- PyTorch and several
+# of its kernel backends JIT-compile at runtime and need W+X pages.
+#
+# NOTE: on an NVIDIA host, PrivateDevices must stay off (its default) so the
+# process can open /dev/nvidia*. Add DeviceAllow= entries if you tighten this.
+
+[Install]
+WantedBy=multi-user.target

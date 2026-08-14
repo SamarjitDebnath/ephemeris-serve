@@ -762,7 +762,7 @@ class TestCliErrorHandling:
     def test_extract_detail_returns_safe_detail_from_json_body(self):
         try:
             import httpx
-            from cli.main import _extract_detail
+            from ephemeris_cli.main import _extract_detail
         except ImportError:
             pytest.skip("Required modules not available")
 
@@ -772,7 +772,7 @@ class TestCliErrorHandling:
     def test_extract_detail_falls_back_when_detail_missing(self):
         try:
             import httpx
-            from cli.main import _extract_detail, _INTERNAL_ERROR_MESSAGE
+            from ephemeris_cli.main import _extract_detail, _INTERNAL_ERROR_MESSAGE
         except ImportError:
             pytest.skip("Required modules not available")
 
@@ -782,12 +782,587 @@ class TestCliErrorHandling:
     def test_extract_detail_falls_back_on_non_json_body(self):
         try:
             import httpx
-            from cli.main import _extract_detail, _INTERNAL_ERROR_MESSAGE
+            from ephemeris_cli.main import _extract_detail, _INTERNAL_ERROR_MESSAGE
         except ImportError:
             pytest.skip("Required modules not available")
 
         response = httpx.Response(500, text="<html>not json</html>")
         assert _extract_detail(response) == _INTERNAL_ERROR_MESSAGE
+
+
+class TestCliClientConfig:
+    """Unit tests for the CLI's server-address resolution (cli/config.py)."""
+
+    def test_packaged_config_supplies_the_default_address(self, monkeypatch):
+        from ephemeris_cli.config import load_config, resolve_base_url
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_URL", raising=False)
+        monkeypatch.delenv("EPHEMERIS_CLIENT_CONFIG", raising=False)
+
+        # No address is hardcoded in the CLI: the packaged YAML is what makes
+        # a bare `ephemeris-serve start` resolve to anything at all.
+        resolved = resolve_base_url(config=load_config())
+        assert resolved.url.startswith("http")
+        assert resolved.source == "client config"
+
+    def test_env_var_overrides_config_file(self, monkeypatch):
+        from ephemeris_cli.config import resolve_base_url
+
+        monkeypatch.setenv("EPHEMERIS_CLIENT_URL", "https://ephemeris.example.com")
+        resolved = resolve_base_url(config={"base_url": "http://127.0.0.1:8080"})
+        assert resolved.url == "https://ephemeris.example.com"
+        assert resolved.source == "$EPHEMERIS_CLIENT_URL"
+
+    def test_url_option_overrides_env_var(self, monkeypatch):
+        from ephemeris_cli.config import resolve_base_url
+
+        monkeypatch.setenv("EPHEMERIS_CLIENT_URL", "https://from-env.example.com")
+        resolved = resolve_base_url(url="https://from-flag.example.com", config={})
+        assert resolved.url == "https://from-flag.example.com"
+        assert resolved.source == "--url"
+
+    def test_port_option_keeps_configured_host_and_scheme(self, monkeypatch):
+        from ephemeris_cli.config import resolve_base_url
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_URL", raising=False)
+        resolved = resolve_base_url(port=9000, config={"base_url": "https://ephemeris.example.com:8080"})
+        assert resolved.url == "https://ephemeris.example.com:9000"
+
+    def test_host_option_keeps_configured_port(self, monkeypatch):
+        from ephemeris_cli.config import resolve_base_url
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_URL", raising=False)
+        resolved = resolve_base_url(host="10.0.0.5", config={"base_url": "http://127.0.0.1:8080"})
+        assert resolved.url == "http://10.0.0.5:8080"
+
+    def test_url_combined_with_host_is_rejected(self):
+        from ephemeris_cli.config import ClientConfigError, resolve_base_url
+
+        with pytest.raises(ClientConfigError):
+            resolve_base_url(url="http://a.example.com", host="b.example.com", config={})
+
+    def test_bare_host_is_normalized_to_http(self):
+        from ephemeris_cli.config import normalize_base_url
+
+        assert normalize_base_url("ephemeris.example.com") == "http://ephemeris.example.com"
+        assert normalize_base_url("ephemeris.example.com:8080") == "http://ephemeris.example.com:8080"
+
+    def test_trailing_slash_is_stripped(self):
+        from ephemeris_cli.config import normalize_base_url
+
+        # Every request path the CLI builds starts with "/", so a trailing
+        # slash here would produce "//health".
+        assert normalize_base_url("https://ephemeris.example.com/") == "https://ephemeris.example.com"
+
+    def test_non_http_scheme_is_rejected(self):
+        from ephemeris_cli.config import ClientConfigError, normalize_base_url
+
+        with pytest.raises(ClientConfigError):
+            normalize_base_url("ftp://ephemeris.example.com")
+
+    def test_user_config_file_overrides_packaged_default(self, monkeypatch, tmp_path):
+        from ephemeris_cli.config import load_config, resolve_base_url
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_URL", raising=False)
+        monkeypatch.delenv("EPHEMERIS_CLIENT_CONFIG", raising=False)
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+        user_config = tmp_path / "ephemeris-serve" / "client.yaml"
+        user_config.parent.mkdir(parents=True)
+        user_config.write_text(
+            'client_config:\n  defaults:\n    base_url: "https://prod.example.com"\n'
+        )
+
+        assert resolve_base_url(config=load_config()).url == "https://prod.example.com"
+
+    def test_timeout_falls_back_to_config_then_option(self, monkeypatch):
+        from ephemeris_cli.config import resolve_timeout
+
+        assert resolve_timeout(None, {"timeout_seconds": 45.0}) == 45.0
+        assert resolve_timeout(5.0, {"timeout_seconds": 45.0}) == 5.0
+
+
+class TestApiKeyAuth:
+    """Unit tests for API-key authentication (api/auth.py)."""
+
+    @staticmethod
+    def _configure(monkeypatch, keys="", admin_keys=""):
+        from settings.settings import secret_settings
+
+        monkeypatch.setattr(secret_settings, "api_keys", keys, raising=False)
+        monkeypatch.setattr(secret_settings, "admin_api_keys", admin_keys, raising=False)
+
+    def test_auth_disabled_when_no_keys_configured(self, monkeypatch):
+        from api.auth import auth_enabled, require_api_key
+
+        self._configure(monkeypatch)
+        # Local development and the test suite rely on this staying open.
+        assert auth_enabled() is False
+        assert require_api_key(authorization=None) is None
+
+    def test_valid_key_is_accepted(self, monkeypatch):
+        from api.auth import require_api_key
+
+        self._configure(monkeypatch, keys="secret-one,secret-two")
+        assert require_api_key(authorization="Bearer secret-two") == "secret-two"
+
+    def test_missing_header_is_rejected_with_401(self, monkeypatch):
+        from fastapi import HTTPException
+        from api.auth import require_api_key
+
+        self._configure(monkeypatch, keys="secret-one")
+        with pytest.raises(HTTPException) as excinfo:
+            require_api_key(authorization=None)
+        assert excinfo.value.status_code == 401
+
+    def test_wrong_key_is_rejected_with_401(self, monkeypatch):
+        from fastapi import HTTPException
+        from api.auth import require_api_key
+
+        self._configure(monkeypatch, keys="secret-one")
+        with pytest.raises(HTTPException) as excinfo:
+            require_api_key(authorization="Bearer nope")
+        assert excinfo.value.status_code == 401
+
+    def test_non_bearer_scheme_is_rejected(self, monkeypatch):
+        from fastapi import HTTPException
+        from api.auth import require_api_key
+
+        self._configure(monkeypatch, keys="secret-one")
+        with pytest.raises(HTTPException):
+            require_api_key(authorization="Basic secret-one")
+
+    def test_admin_key_satisfies_the_ordinary_tier(self, monkeypatch):
+        from api.auth import require_api_key
+
+        self._configure(monkeypatch, keys="", admin_keys="admin-key")
+        assert require_api_key(authorization="Bearer admin-key") == "admin-key"
+
+    def test_ordinary_key_cannot_swap_the_model(self, monkeypatch):
+        from fastapi import HTTPException
+        from api.auth import require_admin_api_key
+
+        self._configure(monkeypatch, keys="user-key", admin_keys="admin-key")
+        with pytest.raises(HTTPException) as excinfo:
+            require_admin_api_key(token="user-key")
+        assert excinfo.value.status_code == 403
+
+    def test_admin_key_can_swap_the_model(self, monkeypatch):
+        from api.auth import require_admin_api_key
+
+        self._configure(monkeypatch, keys="user-key", admin_keys="admin-key")
+        assert require_admin_api_key(token="admin-key") == "admin-key"
+
+    def test_model_swap_refused_when_no_admin_key_configured(self, monkeypatch):
+        from fastapi import HTTPException
+        from api.auth import require_admin_api_key
+
+        # Keys exist but no admin tier: refuse rather than letting every key
+        # load an arbitrary model.
+        self._configure(monkeypatch, keys="user-key", admin_keys="")
+        with pytest.raises(HTTPException) as excinfo:
+            require_admin_api_key(token="user-key")
+        assert excinfo.value.status_code == 403
+
+    def test_generation_routes_declare_the_auth_dependency(self):
+        from api.routes import router
+        from api.auth import require_admin_api_key, require_api_key
+
+        protected = {}
+        for route in router.routes:
+            calls = {dep.dependency for dep in route.dependencies}
+            for method in route.methods:
+                protected[(method, route.path)] = calls
+
+        assert require_api_key in protected[("POST", "/generate")]
+        assert require_api_key in protected[("POST", "/generate_batch")]
+        assert require_api_key in protected[("GET", "/metrics")]
+        # The model-swap route is the dangerous one: admin tier only.
+        assert require_admin_api_key in protected[("POST", "/model")]
+
+
+class TestSecretSettingTolerance:
+    """SecretSetting must not crash on env entries it doesn't own."""
+
+    def test_unknown_env_file_entries_are_ignored(self, tmp_path, monkeypatch):
+        from settings.settings import SecretSetting
+
+        env_file = tmp_path / ".env"
+        # EPHEMERIS_API_KEY (singular) is the *client's* variable, and an
+        # EnvironmentFile in a real deployment carries plenty else besides.
+        # Any of it previously raised ValidationError at import time, taking
+        # the server down before it could log why.
+        env_file.write_text(
+            "HF_KEY=hf_test\n"
+            "EPHEMERIS_CLIENT_API_KEY=client-side-key\n"
+            "EPHEMERIS_SERVER_API_KEYS=server-key\n"
+            "SOMETHING_UNRELATED=x\n"
+        )
+        monkeypatch.delenv("EPHEMERIS_SERVER_API_KEYS", raising=False)
+
+        settings = SecretSetting(_env_file=str(env_file))
+        assert settings.api_keys == "server-key"
+        assert settings.hf_key == "hf_test"
+
+
+class TestClientPathMigration:
+    """The CLI renamed to `ephemeris`; its old on-disk paths still resolve."""
+
+    def test_new_config_dir_used_when_neither_exists(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        assert client_config.user_config_path() == tmp_path / "ephemeris" / "client.yaml"
+
+    def test_legacy_config_dir_used_when_only_it_exists(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        (tmp_path / "ephemeris-serve").mkdir()
+        # An upgrade must not silently ignore a config written under the old name.
+        assert client_config.user_config_path() == tmp_path / "ephemeris-serve" / "client.yaml"
+
+    def test_new_config_dir_wins_when_both_exist(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        (tmp_path / "ephemeris-serve").mkdir()
+        (tmp_path / "ephemeris").mkdir()
+        # Once migrated, the old directory must never resurface.
+        assert client_config.user_config_path() == tmp_path / "ephemeris" / "client.yaml"
+
+    def test_user_level_env_follows_the_same_directory(self, monkeypatch, tmp_path, real_env_file_paths):
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        (tmp_path / "ephemeris-serve").mkdir()
+        # The user-level .env must live beside client.yaml, legacy dir included.
+        assert tmp_path / "ephemeris-serve" / ".env" in real_env_file_paths()
+
+    def test_history_file_names(self):
+        from ephemeris_cli import main as client_main
+
+        assert client_main._HISTORY_FILE.name == ".ephemeris_history"
+        assert client_main._LEGACY_HISTORY_FILE.name == ".ephemeris_serve_history"
+
+    def test_cli_titles_itself_ephemeris(self):
+        from ephemeris_cli import main as client_main
+
+        assert client_main._TITLE == "EPHEMERIS"
+
+
+class TestClientEnvFiles:
+    """The client reads its own .env, and only the keys it owns."""
+
+    def test_env_file_supplies_url_and_key(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_URL", raising=False)
+        monkeypatch.delenv("EPHEMERIS_CLIENT_API_KEY", raising=False)
+
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "EPHEMERIS_CLIENT_URL=https://from-dotenv.example.com\n"
+            "EPHEMERIS_CLIENT_API_KEY=dotenv-key\n"
+        )
+        monkeypatch.setattr(client_config, "env_file_paths", lambda: [env_file])
+
+        assert client_config.resolve_base_url(config={}).url == "https://from-dotenv.example.com"
+        assert client_config.resolve_api_key(config={}).value == "dotenv-key"
+
+    def test_server_keys_in_a_shared_env_file_are_ignored(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_API_KEY", raising=False)
+
+        # The scopes must not bleed even when one file holds both sides --
+        # exactly what happens running the CLI from the server's repo root.
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "HF_KEY=hf_secret\n"
+            "EPHEMERIS_SERVER_API_KEYS=server-only-key\n"
+            "EPHEMERIS_SERVER_ADMIN_API_KEYS=server-admin-key\n"
+        )
+        monkeypatch.setattr(client_config, "env_file_paths", lambda: [env_file])
+
+        assert client_config.load_env_files() == {}
+        assert client_config.resolve_api_key(config={}) is None
+
+    def test_process_environment_beats_env_file(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("EPHEMERIS_CLIENT_API_KEY=from-file\n")
+        monkeypatch.setattr(client_config, "env_file_paths", lambda: [env_file])
+        monkeypatch.setenv("EPHEMERIS_CLIENT_API_KEY", "from-shell")
+
+        assert client_config.resolve_api_key(config={}).value == "from-shell"
+
+    def test_later_env_files_win(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_URL", raising=False)
+        low = tmp_path / "low.env"
+        high = tmp_path / "high.env"
+        low.write_text("EPHEMERIS_CLIENT_URL=http://low.example.com\n")
+        high.write_text("EPHEMERIS_CLIENT_URL=http://high.example.com\n")
+        monkeypatch.setattr(client_config, "env_file_paths", lambda: [low, high])
+
+        assert client_config.resolve_base_url(config={}).url == "http://high.example.com"
+
+    def test_parser_handles_quotes_comments_and_export(self, monkeypatch, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "# a comment\n"
+            "\n"
+            'export EPHEMERIS_CLIENT_API_KEY="quoted-key"\n'
+            "EPHEMERIS_CLIENT_URL='http://quoted.example.com'\n"
+            "MALFORMED_LINE_WITHOUT_EQUALS\n"
+        )
+        parsed = client_config._parse_env_file(env_file)
+        assert parsed["EPHEMERIS_CLIENT_API_KEY"] == "quoted-key"
+        assert parsed["EPHEMERIS_CLIENT_URL"] == "http://quoted.example.com"
+
+    def test_missing_env_files_are_not_an_error(self, tmp_path):
+        from ephemeris_cli import config as client_config
+
+        assert client_config._parse_env_file(tmp_path / "nope.env") == {}
+
+
+class TestClientServerIsolation:
+    """The client distribution must stay installable without the server."""
+
+    def test_client_package_imports_nothing_from_the_server(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        cli_root = Path(__file__).resolve().parent.parent / "packages" / "ephemeris-cli"
+        # A fresh interpreter with only the client package on the path -- if
+        # anything in it reaches for torch/fastapi/the server's settings, this
+        # fails here rather than in a user's thin install.
+        probe = (
+            "import sys; sys.path.insert(0, %r);"
+            "import ephemeris_cli.main, ephemeris_cli.config;"
+            "heavy = [m for m in ('torch','transformers','fastapi','uvicorn','settings','api') "
+            "if m in sys.modules];"
+            "print(','.join(heavy))" % str(cli_root)
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, cwd=str(cli_root)
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "", f"client pulled in server modules: {result.stdout.strip()}"
+
+
+class TestCliAuthConfig:
+    """Unit tests for the CLI's API-key resolution (cli/config.py)."""
+
+    def test_env_var_beats_config_file(self, monkeypatch):
+        from ephemeris_cli.config import resolve_api_key
+
+        monkeypatch.setenv("EPHEMERIS_CLIENT_API_KEY", "from-env")
+        resolved = resolve_api_key(config={"api_keys": "from-file"})
+        assert resolved.value == "from-env"
+        assert resolved.source == "$EPHEMERIS_CLIENT_API_KEY"
+
+    def test_option_beats_env_var(self, monkeypatch):
+        from ephemeris_cli.config import resolve_api_key
+
+        monkeypatch.setenv("EPHEMERIS_CLIENT_API_KEY", "from-env")
+        assert resolve_api_key("from-flag", config={}).value == "from-flag"
+
+    def test_absent_key_resolves_to_none(self, monkeypatch):
+        from ephemeris_cli.config import resolve_api_key
+
+        monkeypatch.delenv("EPHEMERIS_CLIENT_API_KEY", raising=False)
+        # A server with no keys configured accepts unauthenticated requests.
+        assert resolve_api_key(config={}) is None
+
+    def test_auth_headers_omitted_when_no_key(self):
+        from ephemeris_cli.config import auth_headers
+
+        assert auth_headers(None) == {}
+        assert auth_headers("k") == {"Authorization": "Bearer k"}
+
+    def test_mask_secret_never_reveals_the_middle(self):
+        from ephemeris_cli.config import mask_secret
+
+        masked = mask_secret("abcdefghijklmnop")
+        assert masked.startswith("abcd") and masked.endswith("mnop")
+        assert "efghijkl" not in masked
+        assert mask_secret("short") == "*****"
+
+
+class TestCLIRendering:
+    """Terminal rendering rules for the `ephemeris` REPL's boxes and prompt."""
+
+    def _render(self, capsys, columns, func):
+        """Run `func` with the terminal reported as `columns` wide, return its lines."""
+        import os
+        import shutil
+
+        import ephemeris_cli.main as cli_main
+
+        real_size = shutil.get_terminal_size
+        shutil.get_terminal_size = lambda fallback=(80, 24): os.terminal_size((columns, 24))
+        try:
+            func(cli_main)
+        finally:
+            shutil.get_terminal_size = real_size
+        return capsys.readouterr().out.splitlines()
+
+    def test_long_row_wraps_instead_of_breaking_the_border(self, capsys):
+        long_url = "http://a-very-long-hostname-for-testing.example.com:8443/api-prefix"
+        lines = self._render(
+            capsys, 60, lambda m: m._box_row(f"Connected to {long_url}", m._box_width())
+        )
+
+        assert len(lines) > 1, "the long line should have wrapped onto several rows"
+        widths = {len(line) for line in lines}
+        assert len(widths) == 1, f"rows must all be the same width, got {widths}"
+        assert all(line.startswith("│ ") and line.endswith(" │") for line in lines)
+
+    def test_unbreakable_token_is_split_rather_than_overflowing(self, capsys):
+        lines = self._render(capsys, 40, lambda m: m._box_row("x" * 200, m._box_width()))
+
+        assert len(set(len(line) for line in lines)) == 1
+        assert "".join(line[2:-2].rstrip() for line in lines) == "x" * 200
+
+    def test_oversized_top_label_does_not_widen_the_box(self, capsys):
+        lines = self._render(
+            capsys,
+            40,
+            lambda m: (m._box_top("L" * 200, m._box_width()), m._box_bottom(m._box_width())),
+        )
+
+        assert len(lines[0]) == len(lines[1])
+
+    def test_welcome_box_never_prints_any_of_the_api_key(self, capsys):
+        from ephemeris_cli.config import ResolvedValue
+
+        secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
+        lines = self._render(
+            capsys,
+            100,
+            lambda m: m._print_welcome(
+                "http://127.0.0.1:8000",
+                "client config",
+                ResolvedValue(secret, "$EPHEMERIS_CLIENT_API_KEY"),
+                "balanced (temperature 0.7)",
+            ),
+        )
+        rendered = "\n".join(lines)
+
+        assert secret not in rendered
+        # Not even the leading/trailing runs a masked rendering would show.
+        assert secret[:4] not in rendered and secret[-4:] not in rendered
+        assert "API key: set (from $EPHEMERIS_CLIENT_API_KEY)" in rendered
+
+    def test_prompt_is_plain_under_libedit(self, monkeypatch):
+        """libedit counts inline escapes as columns, so a recalled line wraps early
+        and backspace stops erasing; fenced escapes it hoists ahead of the text,
+        losing the colour anyway. An uncoloured prompt is the only one that edits."""
+        import ephemeris_cli.main as cli_main
+
+        monkeypatch.setattr(cli_main, "_stdout_is_tty", lambda: True)
+        monkeypatch.setattr(cli_main, "_readline_is_libedit", lambda: True)
+
+        assert cli_main._readline_safe_prompt("you> ") == "you> "
+
+    def test_prompt_is_fenced_and_yellow_under_gnu_readline(self, monkeypatch):
+        import ephemeris_cli.main as cli_main
+
+        monkeypatch.setattr(cli_main, "_stdout_is_tty", lambda: True)
+        monkeypatch.setattr(cli_main, "_readline_is_libedit", lambda: False)
+
+        styled = cli_main._readline_safe_prompt("you> ")
+
+        # Every escape run fenced, so readline counts the prompt as 5 columns.
+        assert styled == "\001\033[33m\033[1m\002you> \001\033[0m\002"
+
+    def test_prompt_is_unstyled_when_stdout_is_not_a_terminal(self, monkeypatch):
+        import ephemeris_cli.main as cli_main
+
+        monkeypatch.setattr(cli_main, "_stdout_is_tty", lambda: False)
+        assert cli_main._readline_safe_prompt("you> ") == "you> "
+
+
+class TestCLIHistoryFile:
+    """Reading the REPL history file written by either readline flavor."""
+
+    def test_libedit_file_is_decoded_not_taken_literally(self, tmp_path):
+        import ephemeris_cli.main as cli_main
+
+        # Exactly what macOS's libedit writes: a header line, then entries with
+        # every space escaped as an octal \040.
+        path = tmp_path / "history"
+        path.write_text("_HiStOrY_V2_\nfirst\\040unique\\040message\n2\\040+\\0402\\040in\\040one\\040word\n")
+
+        assert cli_main._read_history_entries(path) == [
+            "first unique message",
+            "2 + 2 in one word",
+        ]
+
+    def test_gnu_readline_file_is_read_verbatim(self, tmp_path):
+        import ephemeris_cli.main as cli_main
+
+        path = tmp_path / "history"
+        path.write_text("a real message\nliteral \\040 stays\n")
+
+        # No libedit header, so nothing is an escape sequence here.
+        assert cli_main._read_history_entries(path) == ["a real message", "literal \\040 stays"]
+
+    def test_session_noise_is_dropped(self, tmp_path):
+        import ephemeris_cli.main as cli_main
+
+        path = tmp_path / "history"
+        path.write_text("/exit\nhello\nhello\n\n/quit\nhello again\n")
+
+        assert cli_main._read_history_entries(path) == ["hello", "hello again"]
+
+    def test_missing_file_is_empty_history(self, tmp_path):
+        import ephemeris_cli.main as cli_main
+
+        assert cli_main._read_history_entries(tmp_path / "nope") == []
+
+    def test_history_is_capped_to_the_configured_length(self, tmp_path):
+        import ephemeris_cli.main as cli_main
+
+        path = tmp_path / "history"
+        path.write_text("".join(f"message {i}\n" for i in range(cli_main._HISTORY_LENGTH + 50)))
+
+        entries = cli_main._read_history_entries(path)
+        assert len(entries) == cli_main._HISTORY_LENGTH
+        # The cap keeps the newest entries, not the oldest.
+        assert entries[-1] == f"message {cli_main._HISTORY_LENGTH + 49}"
+
+    def test_save_rewrites_the_file_without_the_noise(self, tmp_path, monkeypatch):
+        import ephemeris_cli.main as cli_main
+
+        path = tmp_path / "history"
+        monkeypatch.setattr(cli_main, "_HISTORY_FILE", path)
+        monkeypatch.setattr(
+            cli_main, "_current_history_entries", lambda: ["hi", "hi", "/exit", "  ", "bye"]
+        )
+
+        cli_main._save_readline_history()
+
+        assert path.read_text() == "hi\nbye\n"
+        # Written in the flavor-neutral format both readers can be handed back.
+        assert cli_main._read_history_entries(path) == ["hi", "bye"]
+
+    def test_saved_file_is_not_world_readable(self, tmp_path, monkeypatch):
+        import ephemeris_cli.main as cli_main
+
+        path = tmp_path / "history"
+        monkeypatch.setattr(cli_main, "_HISTORY_FILE", path)
+        monkeypatch.setattr(cli_main, "_current_history_entries", lambda: ["a prompt"])
+
+        cli_main._save_readline_history()
+
+        # Prompts can carry anything the user typed; keep them owner-only.
+        assert path.stat().st_mode & 0o077 == 0
 
 
 class TestPagedKVCache:

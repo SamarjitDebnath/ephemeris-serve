@@ -31,6 +31,26 @@ async def lifespan(app: FastAPI):
     from scheduler.continuous_scheduler import ContinuousScheduler
     from engine.generator import engine
 
+    # API-key authentication (see api/auth.py). Absent keys means every /api
+    # route is open, which is deliberate for local development but must never
+    # be the case for a deployment reachable from outside localhost -- so it
+    # is warned about loudly rather than silently allowed.
+    from api.auth import admin_api_keys, auth_enabled
+
+    if not auth_enabled():
+        logger.warning(
+            "No API keys configured (EPHEMERIS_API_KEYS): every /api route is UNAUTHENTICATED, "
+            "including POST /api/model, which loads arbitrary Hugging Face models. "
+            "Do not expose this server beyond localhost."
+        )
+    elif not admin_api_keys():
+        logger.warning(
+            "EPHEMERIS_API_KEYS is set but EPHEMERIS_ADMIN_API_KEYS is not: "
+            "POST /api/model will reject every request."
+        )
+    else:
+        logger.info("API-key authentication enabled.")
+
     # Hugging Face authentication
     if not secret_settings.hf_key:
         logger.warning("Token for Hugging Face Hub not found. Using anonymous access.")

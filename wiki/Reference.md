@@ -122,9 +122,13 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 ## Module Reference
 
 - `main.py`: server entrypoint (`uvicorn.run`), used by `make run`/`make run-prod`.
-- `cli/main.py`: `ephemeris-serve` CLI -- `serve` (alternative server entrypoint with `--model`) and `start` (boxed-UI REPL chat client with `/model` command).
-- `cli/logo.py`: precomputed block-art rendering of the project logo, used by the CLI's startup splash.
+- `api/cli.py`: `ephemeris-serve` CLI (server distribution) -- the `serve` command.
+- `packages/ephemeris-cli/ephemeris_cli/main.py`: `ephemeris` CLI (client distribution) -- `start` (boxed-UI REPL chat client with `/model` command) and `config`.
+- `packages/ephemeris-cli/ephemeris_cli/config.py`: client-side config for the CLI -- resolves the server address from options, `$EPHEMERIS_CLIENT_URL`, and config files.
+- `packages/ephemeris-cli/ephemeris_cli/client_config.yaml`: packaged client defaults (`base_url`, `timeout_seconds`).
+- `packages/ephemeris-cli/ephemeris_cli/logo.py`: precomputed block-art rendering of the project logo, used by the CLI's startup splash.
 - `api/server.py`: FastAPI app creation, lifespan (model/tokenizer/scheduler startup, `app.state.scheduler`), shutdown.
+- `api/auth.py`: API-key authentication dependencies (`require_api_key`, `require_admin_api_key`) and the two key tiers.
 - `api/routes.py`: `/generate`, `/generate_batch`, `/model` (GET/POST), `/metrics` route handlers.
 - `engine/model_loader.py`: model loading, device placement, warmup, and runtime `reload()`.
 - `engine/generator.py`: token sampling, forward pass, repetition penalty, batched generation, `invalidate_model_cache()`.
@@ -146,6 +150,8 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 - `utils/stop_sequences.py`: shared `find_stop_index()` used by the streaming, scheduler, and engine paths.
 - `utils/errors.py`: `INTERNAL_ERROR_MESSAGE` -- the generic client-facing message for unexpected failures.
 - `utils/device_cache.py`: `empty_device_cache()`/`device_memory_pressure()`/`maybe_empty_device_cache()` -- reactive and proactive CUDA/MPS cache clearing.
+- `deploy/nginx/ephemeris-serve.conf`: reverse-proxy config (SSE-safe `/api/generate` location, TLS template).
+- `deploy/systemd/ephemeris-serve.service`: systemd unit (loopback bind, relative-path working directory, model-load start timeout).
 
 ---
 
@@ -176,4 +182,4 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 
 ## How to Read the Code per Module
 
-Same order as [Module Reference](#module-reference) above -- start at `main.py`/`cli/main.py` for entrypoints, then `api/` for HTTP surface, `scheduler/`+`cache/`+`engine/` for the generation core, `streaming/` for how tokens leave the process, and `settings/`+`schemas/`+`logger/`+`utils/` for cross-cutting concerns.
+Same order as [Module Reference](#module-reference) above -- start at `main.py`/`api/cli.py` for entrypoints, then `api/` for HTTP surface, `scheduler/`+`cache/`+`engine/` for the generation core, `streaming/` for how tokens leave the process, and `settings/`+`schemas/`+`logger/`+`utils/` for cross-cutting concerns.

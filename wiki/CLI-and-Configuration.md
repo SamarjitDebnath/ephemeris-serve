@@ -2,22 +2,42 @@
 
 ## CLI Layer
 
-### `cli/main.py`
+The repository ships **two distributions with two separate command-line entry points**, because the chat client is meant to be installed on machines that will never run a model:
 
-`click`-based CLI, installed as the `ephemeris-serve` console script (`[project.scripts]` in `pyproject.toml`). Two subcommands under one `@click.group()`:
+| Distribution | Source | Command | Dependencies |
+| --- | --- | --- | --- |
+| `ephemeris-serve` | repo root (`api/`, `engine/`, `scheduler/`, ...) | `ephemeris-serve` | fastapi, uvicorn, torch, transformers, ... |
+| `ephemeris-cli` | `packages/ephemeris-cli/` | `ephemeris start` | click, httpx, pyyaml |
+
+They share no code, no configuration files, and no environment variables. The client speaks HTTP to the server and imports nothing from it -- enforced by a test that imports the client package in a clean interpreter and asserts none of `torch`/`transformers`/`fastapi`/`uvicorn`/`settings`/`api` ended up in `sys.modules`.
+
+### `api/cli.py` (server distribution)
+
+`click`-based CLI, installed as the `ephemeris-serve` console script. One subcommand:
 
 `ephemeris-serve serve` -- **runs the server itself**:
-- Options: `--model` (HF repo id, overrides `settings/config.yaml`'s `model_name` for this run), `--host` (default `0.0.0.0`), `--port` (default `8000`), `--workers` (default `1`), `--reload/--no-reload` (default off).
-- If `--model` is given, sets `os.environ["EPHEMERIS_MODEL_NAME"]` *before* calling `uvicorn.run(...)` -- an env var rather than an in-process settings mutation, so it's correctly inherited even when `--workers > 1` makes uvicorn spawn fresh worker processes that re-import `settings.settings` from scratch (see `ModelSetting` in [Configuration](#configuration)).
-- Calls `uvicorn.run("api.server:app", host=host, port=port, workers=workers, reload=reload)` -- functionally equivalent to `python main.py`, but with these as CLI flags instead of hardcoded values.
+- Options: `--model` (HF repo id, overrides `settings/config.yaml`'s `model_name` for this run), `--host` (default `0.0.0.0`), `--port` (default `8000`), `--workers` (default `1`), `--reload/--no-reload` (default off), `--proxy-headers/--no-proxy-headers` (default on), `--forwarded-allow-ips` (default `127.0.0.1`).
+- If `--model` is given, sets `os.environ["EPHEMERIS_SERVER_MODEL_NAME"]` *before* calling `uvicorn.run(...)` -- an env var rather than an in-process settings mutation, so it's correctly inherited even when `--workers > 1` makes uvicorn spawn fresh worker processes that re-import `settings.settings` from scratch (see `ModelSetting` in [Configuration](#configuration)).
+- `--proxy-headers`/`--forwarded-allow-ips` are passed straight to `uvicorn.run()`, so the app reads the real client address and scheme from `X-Forwarded-For`/`X-Forwarded-Proto` when it sits behind the nginx reverse proxy (see [Reverse Proxy](Operations#reverse-proxy) below). Trusting those headers is only safe while nothing but the local proxy can reach the port, hence the loopback-only default allow-list.
+- Calls `uvicorn.run("api.server:app", host=host, port=port, workers=workers, reload=reload, proxy_headers=..., forwarded_allow_ips=...)` -- functionally equivalent to `python main.py`, but with these as CLI flags instead of hardcoded values.
 
-`ephemeris-serve start` -- **REPL chat client** against an already-running server (does not load a model itself; talks to `/api/generate`'s SSE stream over HTTP):
-- Options: `--host` (default `127.0.0.1`), `--port` (default `8000`), `--max-tokens`, `--temperature`, `--timeout` (default `120.0`s, per-request HTTP timeout), `--stop` (repeatable; default `("\nuser:", "\nUser:")` -- guards against models that don't reliably emit EOS at the turn boundary and keep generating a hallucinated next turn; pass `--stop ''` once to disable).
-- On start: checks `/health`, raising a `click.ClickException` with a helpful message if the server isn't reachable.
-- Prints `_print_splash()` (see below), then `_print_welcome(base_url)`, then loads REPL command history (see below), then enters the REPL loop.
-- Arrow-key line editing and history: at import time, `cli/main.py` tries `import readline` (wrapped in `try`/`except ImportError`, since it isn't available on Windows without a third-party `pyreadline3` install; `readline` is set to `None` if unavailable). Merely importing it is enough to give `click.prompt`'s underlying `input()` proper left/right cursor movement and up/down history recall -- without it, arrow keys just insert raw terminal escape sequences into the line instead of editing it. If `readline` loaded successfully, `start()` calls `readline.set_history_length(1000)` and `readline.read_history_file(_HISTORY_FILE)` (`~/.ephemeris_serve_history`, ignoring `FileNotFoundError`/`OSError` on first run) right before the REPL loop, and `readline.write_history_file(_HISTORY_FILE)` on the way out, so command history persists across sessions like a shell's.
+### `packages/ephemeris-cli/ephemeris_cli/main.py` (client distribution)
+
+`click`-based CLI, installed as the `ephemeris start` console script. Two subcommands under one `@click.group()`.
+
+`ephemeris start` -- **REPL chat client** against an already-running server (does not load a model itself; talks to `/api/generate`'s SSE stream over HTTP):
+- Options: `--url` (full base URL), `--host`/`--port` (override just one part of the configured address; mutually exclusive with `--url`), `--max-tokens`, `--temperature`, `--timeout` (per-request HTTP timeout), `--stop` (repeatable; default `("\nuser:", "\nUser:")` -- guards against models that don't reliably emit EOS at the turn boundary and keep generating a hallucinated next turn; pass `--stop ''` once to disable).
+- The server address has no hardcoded default in Python: `start()` calls `ephemeris_cli.config.resolve_base_url()`/`resolve_timeout()`, which layer command-line options over `$EPHEMERIS_CLIENT_URL` over the config files (see [`ephemeris_cli/config.py`](#packagesephemeris-cliephemeris_cliconfigpy-client-distribution) below). `--timeout` likewise falls back to the config file's `timeout_seconds`.
+- On start: checks `/health`, raising a `click.ClickException` if the server isn't reachable -- the message names the resolved address *and which layer supplied it*, since a connection failure is as often a misconfigured address as a stopped server.
+
+- Prints `_print_splash()` (see below), then `_print_welcome(base_url, base_url_source, temperature_label)`, then loads REPL command history (see below), then enters the REPL loop.
+- `_init_readline()`/`_save_readline_history()`: history setup. macOS ships Python linked against **libedit** rather than GNU readline, and the two take incompatible `parse_and_bind` syntax -- a GNU-style binding string is silently ignored by libedit -- so up/down are bound explicitly for both flavors. A refused binding is swallowed rather than stopping the REPL.
+- `_readline_safe_prompt(text)`: styles the prompt with the ANSI runs fenced in `\001`/`\002`. readline counts prompt characters to track the cursor; unfenced escapes are invisible on screen but not to that count, which misplaces the cursor once a recalled line wraps.
+- Arrow-key line editing and history: at import time, `packages/ephemeris-cli/ephemeris_cli/main.py` tries `import readline` (wrapped in `try`/`except ImportError`, since it isn't available on Windows without a third-party `pyreadline3` install; `readline` is set to `None` if unavailable). Merely importing it is enough to give `click.prompt`'s underlying `input()` proper left/right cursor movement and up/down history recall -- without it, arrow keys just insert raw terminal escape sequences into the line instead of editing it. If `readline` loaded successfully, `start()` calls `readline.set_history_length(1000)` and `readline.read_history_file(_HISTORY_FILE)` (`~/.ephemeris_history`, ignoring `FileNotFoundError`/`OSError` on first run) right before the REPL loop, and `readline.write_history_file(_HISTORY_FILE)` on the way out, so command history persists across sessions like a shell's.
 - REPL loop: reads a line via `click.prompt`; `/exit`/`/quit`/Ctrl-D/EOF ends the session; `/model` or `/model <name>` is routed to `_handle_model_command`; `/creativity` or `/creativity <preset|number>` is routed to `_handle_creativity_command`; anything else is sent as a prompt.
 - Per turn: builds the JSON payload (`prompt`, optional `max_tokens`/`temperature`/`stop`), opens a `_StreamingBox("assistant", ...)`, and calls `_stream_reply(client, payload, box)`, feeding the box on success or an error message on `RuntimeError`/`httpx.HTTPError`, always closing the box in a `finally`.
+
+`ephemeris config` -- **prints the resolved client configuration**: the effective `base_url` and where it came from, the effective `timeout_seconds`, every config file consulted (marking which exist), and the relevant environment variables. Purely diagnostic; it makes no network call.
 
 `_stream_reply(client, payload, box)`:
 - POSTs to `/api/generate` with `Accept: text/event-stream`; raises `RuntimeError` on a `>=400` status.
@@ -35,12 +55,52 @@
 
 Box-drawing helpers (all colored via `click.secho`, magenta borders unless noted):
 - `_box_width()`: `max(min(terminal_columns - 4, 76), 20)` -- the content width used by every box.
+- `_box_indent(width)`: left padding that centers a box in the terminal. A box occupies `width + 4` columns (two borders plus a space of padding each side), and boxes cap at 76 columns, so without this they would sit hard against the left edge on a wide terminal while the splash's logo is centered.
 - `_box_top(label, width, border_color)` / `_box_bottom(width, border_color)` / `_box_row(text, width, border_color, fg, bold)`: draw one border/content line each; a top+bottom pair plus N rows always total the same fixed character width, so boxes stay aligned regardless of content.
 - `_StreamingBox`: a box that grows as text is fed into it (`.feed(text)`), word-wrapping to its width as content accumulates, and closes its bottom border on `.close()`. Used to render the assistant's reply live as SSE deltas arrive, rather than buffering the whole response before drawing anything.
-- `_print_welcome(base_url, temperature_label)`: the boxed connection-status panel shown once the REPL is ready -- title/version, tagline, `Connected to <base_url>`, the resolved `Creativity: <temperature_label>`, and usage hints (including `/model` and `/creativity`).
-- `_print_splash()`: shown once, before connecting -- a small "✦ Welcome to Ephemeris Serve!" box, the block-art logo (`LOGO_LINES`, from `cli/logo.py`) centered in the terminal, the title, and a "Press Enter to continue" gate (blocks on a bare `input()`). Skipped entirely (falls straight through) if the terminal is narrower than the logo's fixed width, since a wrapped block-art render would just be noise.
+- `_print_welcome(base_url, base_url_source, temperature_label)`: the boxed connection-status panel shown once the REPL is ready -- title/version, tagline, `Connected to <base_url> (from <source>)`, the resolved `Creativity: <temperature_label>`, and usage hints (including `/model` and `/creativity`).
+- `_print_splash()`: shown once, before connecting -- a small "✦ Welcome to Ephemeris Serve!" box, the block-art logo (`LOGO_LINES`, from `packages/ephemeris-cli/ephemeris_cli/logo.py`) centered in the terminal, the title, and a "Press Enter to continue" gate (blocks on a bare `input()`). Skipped entirely (falls straight through) if the terminal is narrower than the logo's fixed width, since a wrapped block-art render would just be noise.
 
-### `cli/logo.py`
+### `packages/ephemeris-cli/ephemeris_cli/config.py` (client distribution)
+
+Client-side configuration for the CLI: which server to talk to, and for how long to wait. It lives in the client distribution and never imports `settings/settings.py` -- that module imports `torch` and reads `settings/config.yaml` by a repo-relative path, neither of which holds when the CLI is installed as a console script and run from an arbitrary directory. `packages/ephemeris-cli/ephemeris_cli/config.py` depends only on `yaml` and the standard library.
+
+Resolution order for the server address, highest priority first:
+1. `--url`, or `--host`/`--port`
+2. the `EPHEMERIS_CLIENT_URL` environment variable
+3. the client's own `.env` files
+4. the file named by `EPHEMERIS_CLIENT_CONFIG`
+5. the user-level file: `$XDG_CONFIG_HOME/ephemeris/client.yaml`, else `~/.config/ephemeris/client.yaml`
+6. the packaged default, `packages/ephemeris-cli/ephemeris_cli/client_config.yaml`
+
+`user_config_dir()`: the client's config directory, `$XDG_CONFIG_HOME/ephemeris` (else `~/.config/ephemeris`), falling back to the pre-rename `ephemeris-serve` directory **only** when that one exists and the current one does not -- so an upgrade keeps working and a migrated user never sees the old path resurface. `legacy_user_config_dir()` names the old location. The history file behaves the same way (`_HISTORY_FILE`/`_LEGACY_HISTORY_FILE` in `main.py`).
+
+`env_file_paths()`: the `.env` files consulted, lowest priority first -- `packages/ephemeris-cli/.env` (the package's own, resolved relative to the module and simply absent in a wheel install), `~/.config/ephemeris/.env`, `./.env` in the invocation directory, and the file named by `EPHEMERIS_CLIENT_ENV`.
+
+`_parse_env_file(path)`: a ~25-line `KEY=value` parser (comments, blank lines, `export ` prefixes, optional quoting) rather than a `python-dotenv` dependency -- this distribution stays at three dependencies. Crucially it **only accepts `EPHEMERIS_CLIENT_*` keys**: a `.env` holding the server's `HF_KEY`/`EPHEMERIS_SERVER_*` contributes nothing, so running the client from the server's repo root -- where `./.env` *is* the server's file -- cannot leak one scope into the other.
+
+`env_value(name)`: the real process environment first, `.env` second, matching every other dotenv implementation -- a value exported for one command must beat a file written months ago.
+
+`load_config()`: merges every config file into one mapping, layered packaged → user-level → `$EPHEMERIS_CLIENT_CONFIG`, later files winning. Each file contributes its `client_config.defaults` mapping, so an override file only has to name the keys it actually changes. A file that doesn't exist contributes nothing (a missing user-level override is "nothing set here", not an error); a file that exists but can't be parsed, or has the wrong shape, raises `ClientConfigError`.
+
+`normalize_base_url(value)`: returns a scheme-qualified base URL with no trailing slash. A bare `host` or `host:port` is assumed to be plain HTTP, so an operator can write `ephemeris.example.com` in a config file without it parsing as a relative path. Rejects any scheme other than `http`/`https`, and a URL with no host. A path prefix is preserved (a proxy may mount the API under a subpath) but the trailing slash is dropped, since every request path the CLI builds already starts with one.
+
+`resolve_base_url(url, host, port, config) -> ResolvedBaseUrl`: applies the order above and returns a `(url, source)` `NamedTuple` -- the `source` string ("`--url`", "`$EPHEMERIS_CLIENT_URL`", "client config", ...) is shown in the welcome box and in the connection-failure message, so a wrong address is traceable to the layer that set it. `--url` combined with `--host`/`--port` is rejected rather than silently resolved. Given only `--host` or only `--port`, the missing half is taken from the configured address, so `--port 9000` alone still points at the configured host and scheme.
+
+`resolve_timeout(timeout, config) -> float`: the `--timeout` option, else the config files' `timeout_seconds`, else a built-in fallback.
+
+`_FALLBACK_BASE_URL`/`_FALLBACK_TIMEOUT_SECONDS` are last-resort values used only if the packaged config file is missing or unreadable (e.g. a partial install) -- keeping them here rather than in the CLI's option defaults means exactly one module in Python knows an address at all.
+
+### `packages/ephemeris-cli/ephemeris_cli/client_config.yaml`
+
+The packaged client defaults, shipped inside the `ephemeris_cli` package (`[tool.setuptools.package-data]` includes `*.yaml`) and located via `Path(__file__).with_name(...)` -- no repo-relative path, no server-side import.
+
+- `base_url`: `http://127.0.0.1:8080` -- the nginx reverse proxy's port (see [Reverse Proxy](Operations#reverse-proxy)), not uvicorn's `8000`, so the default path exercises the same route real clients take. Bypass the proxy with `http://127.0.0.1:8000`.
+- `timeout_seconds`: `120.0`.
+
+This file is overwritten on reinstall/upgrade; a real deployment sets its address in the user-level file instead.
+
+### `packages/ephemeris-cli/ephemeris_cli/logo.py`
 
 `LOGO_LINES: list[str]` -- a **precomputed** (not regenerated at runtime) 36-column-wide, 18-row block-character rendering of the Ephemeris Serve logo, built from the vector geometry in `docs/assets/images/ephemeris-serve-logo.png` (an astronomical-instrument motif: graduated scale ring, tilted elliptical orbit, position markers, crosshair), rasterized onto a 36x36 grid with a wider stroke threshold than a literal 1:1 trace, for a smaller, bolder mark. Packed two rows per output line using Unicode half-block characters (`▀`/`▄`/`█`) for double vertical resolution -- hence 18 output lines for a 36-row grid. Originally a 48-wide/24-line rendering, shrunk so it fits more terminals without wrapping (see `_print_splash()`'s narrow-terminal skip, above).
 
@@ -65,7 +125,7 @@ Imports:
 
 `ModelSetting`:
 - Reads `model_config.defaults` from `settings/config.yaml`.
-- `model_name`: `os.environ.get("EPHEMERIS_MODEL_NAME")` if set, else the YAML default. This is how `ephemeris-serve serve --model` picks a model without editing the YAML file, and it's read via an env var (not a later in-process mutation) specifically so it survives uvicorn spawning fresh worker processes when `--workers > 1`.
+- `model_name`: `os.environ.get("EPHEMERIS_SERVER_MODEL_NAME")` if set, else the YAML default. This is how `ephemeris-serve serve --model` picks a model without editing the YAML file, and it's read via an env var (not a later in-process mutation) specifically so it survives uvicorn spawning fresh worker processes when `--workers > 1`.
 - `device`: resolved via `resolve_device(config["device"])`.
 - `max_length`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, `num_return_sequences`: passed through from YAML.
 
@@ -102,5 +162,5 @@ Current defaults:
 - `kv_block_size: 16`
 
 Notes:
-- The model name is easily replaceable with any compatible causal language model -- at process start via this file or `EPHEMERIS_MODEL_NAME`/`ephemeris-serve serve --model`, or at runtime via `POST /api/model` / the CLI's `/model` command.
+- The model name is easily replaceable with any compatible causal language model -- at process start via this file or `EPHEMERIS_SERVER_MODEL_NAME`/`ephemeris-serve serve --model`, or at runtime via `POST /api/model` / the CLI's `/model` command.
 - The device field supports `"auto"`, `"cpu"`, `"cuda"`, `"cuda:1"`, or `"mps"`.
