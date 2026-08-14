@@ -1,0 +1,1 @@
+Generated from the Ephemeris Serve source tree. Edit the pages in [`wiki/`](https://github.com/SamarjitDebnath/ephemeris-serve/tree/main/wiki) and run `make wiki-sync` — direct edits in the GitHub wiki UI are overwritten on the next sync.

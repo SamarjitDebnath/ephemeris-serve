@@ -7,7 +7,7 @@ Ephemeris Serve
 
 Ephemeris Serve is an LLM inference server with continuous scheduling, dynamic batching, and SSE streaming for token-level outputs.
 
-**[Project site](https://samarjitdebnath.github.io/ephemeris-serve/) · [API reference](https://samarjitdebnath.github.io/ephemeris-serve/api.html)**
+**[Project site](https://samarjitdebnath.github.io/ephemeris-serve/) · [API reference](https://samarjitdebnath.github.io/ephemeris-serve/api.html) · [Technical documentation (wiki)](https://github.com/SamarjitDebnath/ephemeris-serve/wiki)**
 
 Key features
 ------------
@@ -173,6 +173,19 @@ Project layout
 - `schemas/` — Pydantic request/response models
 - `tests/` — unit and integration tests
 - `docs/` — microsite (landing page + API reference), served directly by GitHub Pages from `main` / `docs`
+- `wiki/` — source of truth for the [GitHub wiki](https://github.com/SamarjitDebnath/ephemeris-serve/wiki) (see below)
+
+Documentation
+-------------
+The in-depth technical documentation lives in the [GitHub wiki](https://github.com/SamarjitDebnath/ephemeris-serve/wiki). The wiki is **generated from `wiki/` in this repository**, so it is version-controlled and reviewable in pull requests like any other file.
+
+To change a wiki page, edit the matching file under `wiki/` and publish it:
+
+```bash
+make wiki-sync
+```
+
+Edits made directly in the GitHub wiki UI are overwritten by the next sync. The first sync requires the wiki to exist: enable **Settings → Features → Wikis**, then create any one page in the wiki UI so GitHub provisions the `.wiki.git` repository.
 
 Contributing
 ------------

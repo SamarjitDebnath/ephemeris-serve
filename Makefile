@@ -1,4 +1,4 @@
-.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs build-ephemeris
+.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs build-ephemeris wiki-sync
 
 help:
 	@echo "LLM Inference Server - Available Commands"
@@ -25,6 +25,7 @@ help:
 	@echo ""
 	@echo "Utilities:"
 	@echo "  make logs         - Tail application logs"
+	@echo "  make wiki-sync    - Publish wiki/ to the GitHub wiki"
 	@echo "  make clean        - Remove cache, logs, and build artifacts"
 
 install:
@@ -71,6 +72,9 @@ check: format lint
 
 logs:
 	tail -f logs/app.log
+
+wiki-sync:
+	bash scripts/sync_wiki.sh
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
