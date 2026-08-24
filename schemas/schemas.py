@@ -17,6 +17,23 @@ class GenerateRequest(BaseModel):
         description="Standard LLM temperature range is usually 0.0 to 2.0"
     )
 
+    # `sample()` already treats 0 / 1.0 as "filter disabled" (see
+    # engine/generator.py), so those are the permissive ends of these ranges.
+    # `top_p: 0.0` is excluded deliberately -- it would filter every token and
+    # surface as an empty distribution mid-generation rather than a 422 here.
+    top_k: int | None = Field(
+        default=None,
+        ge=0,
+        description="Keep only the k highest-probability tokens; 0 disables top-k filtering",
+    )
+
+    top_p: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Nucleus sampling mass; 1.0 disables top-p filtering",
+    )
+
     idempotency_key: str | None = Field(
         default=None,
         max_length=200,
@@ -69,3 +86,22 @@ class ModelSwapRequest(BaseModel):
 
 class ModelSwapResponse(BaseModel):
     model_name: str = Field(..., description="The model currently loaded and serving requests")
+
+    # A swap cannot be atomic across workers: each drains its own in-flight
+    # requests before reloading, and those drains finish at different times.
+    # Rather than hide that, the response reports it, so a client can poll to
+    # completion instead of guessing. All three are null when cross-worker
+    # coordination is disabled (`scheduler_config.model_state_dir` unset),
+    # which is the single-process case where they would be meaningless.
+    generation: int | None = Field(
+        default=None,
+        description="Monotone counter for the published model target; null when coordination is disabled",
+    )
+    converged_workers: int | None = Field(
+        default=None,
+        description="Workers that have reached this generation; null when coordination is disabled",
+    )
+    known_workers: int | None = Field(
+        default=None,
+        description="Workers that have reported any generation; null when coordination is disabled",
+    )

@@ -1,0 +1,19 @@
+{
+  "extraPaths": ["packages/ephemeris-cli"],
+  "include": [
+    "api",
+    "cache",
+    "engine",
+    "logger",
+    "metrics",
+    "scheduler",
+    "schemas",
+    "settings",
+    "streaming",
+    "tokenizer",
+    "utils",
+    "tests",
+    "packages/ephemeris-cli/ephemeris_cli"
+  ],
+  "exclude": ["**/__pycache__", ".venv"]
+}

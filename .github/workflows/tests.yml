@@ -28,6 +28,10 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e ".[dev]"
+
+    - name: Install the chat client
+      run: |
+        pip install -e packages/ephemeris-cli
     
     - name: Lint with flake8
       run: |
@@ -43,3 +47,19 @@ jobs:
       run: |
         pytest tests/test_integration.py -v
       continue-on-error: true
+
+    # Latency thresholds are not enforced here -- see `enforce_on_ci` in
+    # TESTING.md. This step records the measurements so the report is
+    # readable from the PR without a local run.
+    - name: Run scenario benchmarks
+      run: |
+        pytest tests/test_latency.py -v --report-md=reports/test_report.md
+      continue-on-error: true
+
+    - name: Upload the scenario report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: scenario-report-py${{ matrix.python-version }}
+        path: reports/test_report.md
+        if-no-files-found: ignore

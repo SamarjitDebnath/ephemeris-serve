@@ -21,7 +21,68 @@ scheduler_config:
       batch_generation_timeout_seconds: 25.0
       idempotency_key_ttl_seconds: 300.0
       model_swap_drain_timeout_seconds: 30.0 # max time POST /api/model waits for in-flight requests to finish before giving up
+      # Extra tokens decoded beyond the longest stop sequence when checking for
+      # a stop match (see ContinuousScheduler._dispatch_tokens). Sized in tokens
+      # against a character length, which is safe in the conservative direction:
+      # every token decodes to at least one character. Cost is linear in this
+      # and measured in microseconds, so prefer generous over tight.
+      stop_window_slack_tokens: 16
+      # Request fairness (see scheduler/request_queue.py). A request asking for
+      # at most this many tokens takes the short lane, which has slots reserved
+      # for it so a burst of long generations cannot starve it. Aging promotes
+      # a waiting long request: after `priority_aging_seconds` it outranks a
+      # newly-arrived short one, which is what stops the reservation from
+      # starving the long lane in turn. Keep it well below
+      # `streaming_request_timeout_seconds` so promotion happens long before
+      # the eviction that would otherwise drop the request.
+      short_request_max_tokens: 64
+      short_lane_reserved_slots: 2
+      priority_aging_seconds: 10.0
+      # Directory for cross-worker model-swap coordination (see
+      # scheduler/model_state.py). Empty means single-process behavior: a swap
+      # reloads only the worker that handled the request, which is correct for
+      # `make run` and wrong for `make run-prod --workers 4`. Set it to a
+      # writable path shared by every worker on the host to make a swap
+      # converge across the pool.
+      model_state_dir: ""
+      model_state_poll_seconds: 2.0 # how often an idle worker checks for a swap published by another
+
+rate_limit_config:
+   defaults:
+      # Per-API-key (or per-client-address when auth is disabled) throttling.
+      # Off by default, mirroring how API-key auth stays open until configured
+      # -- `make run` and the test suite must work with no setup. Any
+      # deployment reachable from outside localhost should turn this on.
+      #
+      # Note this is per worker process: `make run-prod` runs --workers 4, so
+      # the effective limit is 4x these numbers. Adequate for abuse prevention,
+      # not for billing-grade quota.
+      enabled: false
+      requests_per_second: 5.0
+      burst: 20 # bucket capacity: how large a burst is allowed before the rate binds
+      max_concurrent_requests: 8 # 0 disables the concurrency cap, leaving only the rate
+
+metrics_config:
+   defaults:
+      # Prometheus text-format export at GET /metrics, alongside the JSON at
+      # GET /api/metrics (which the CLI consumes and which is unaffected).
+      # Requires the optional 'metrics' extra: pip install -e ".[metrics]".
+      #
+      # `require_auth: true` keeps the endpoint behind the ordinary API key.
+      # Prometheus can send one, but the usual pattern is to leave this false
+      # and simply not route the port publicly -- metrics leak traffic volume
+      # and model identity, so this should be a deliberate choice either way.
+      prometheus_enabled: false
+      require_auth: true
 
 cache_config:
    defaults:
       kv_block_size: 16
+      # Paged KV pool reclamation. The pool grows by doubling under load and,
+      # without these, never gives that capacity back -- a single burst sets
+      # the process memory floor for the rest of its lifetime. The dwell is
+      # deliberately conservative: bursts spaced closer than this never pay
+      # the re-growth cost.
+      kv_pool_trim_idle_seconds: 60.0 # scheduler must be idle this long before any trim
+      kv_pool_peak_decay: 0.9 # per idle tick, how fast the remembered peak usage fades
+      kv_pool_peak_slack: 1.5 # headroom multiplier over remembered peak; the trim floor

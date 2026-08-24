@@ -177,7 +177,7 @@
   <section id="features">
     <div class="section-head">
       <h2>What the scheduler actually does</h2>
-      <p class="eyebrow-label">eight things, working together</p>
+      <p class="eyebrow-label">ten things, working together</p>
     </div>
     <div class="features">
       <div class="feature">
@@ -188,7 +188,7 @@
       <div class="feature">
         <span class="n">02</span>
         <h3>Mixed prefill + decode</h3>
-        <p>A paged KV cache lets a brand-new prompt and an in-progress generation share the same forward pass.</p>
+        <p>A paged KV cache lets a brand-new prompt and an in-progress generation share the same forward pass. Its block pool gives capacity back when traffic dies down, so one burst doesn&rsquo;t set the memory floor for the process lifetime.</p>
       </div>
       <div class="feature">
         <span class="n">03</span>
@@ -203,12 +203,22 @@
       <div class="feature">
         <span class="n">05</span>
         <h3>Hot model swap</h3>
-        <p>Swap the loaded model via <code>/api/model</code>, draining in-flight requests first — no restart.</p>
+        <p>Swap the loaded model via <code>/api/model</code>, draining in-flight requests first — no restart. Across a worker pool the swap propagates and the API reports how far it has converged, rather than pretending it was atomic.</p>
       </div>
       <div class="feature">
         <span class="n">06</span>
         <h3>Metrics &amp; health</h3>
-        <p>Queue latency, batch occupancy, and cache utilization, exposed on <code>/api/metrics</code>.</p>
+        <p>Queue latency, batch occupancy, and cache utilization on <code>/api/metrics</code>, plus raw Prometheus counters and histograms on <code>/metrics</code> — the second is not the first pre-averaged.</p>
+      </div>
+      <div class="feature">
+        <span class="n">07</span>
+        <h3>Short-request fairness</h3>
+        <p>A burst of long generations can&rsquo;t starve short ones: the scheduler reserves batch slots for them and ages waiting requests forward, so neither lane starves the other.</p>
+      </div>
+      <div class="feature">
+        <span class="n">08</span>
+        <h3>Per-key rate limiting</h3>
+        <p>A token bucket and a concurrency cap, keyed by API key rather than address. A batch is charged its sub-request count, so batching can&rsquo;t be used to slip past the limit.</p>
       </div>
       <div class="feature">
         <h3>API-key auth</h3>
@@ -264,6 +274,17 @@
       <img src="assets/images/chat-cli1.png" alt="Ephemeris Serve CLI startup splash">
       <img src="assets/images/chat-cli2.png" alt="Ephemeris Serve CLI /model command">
       <img src="assets/images/chat-cli3.png" alt="Ephemeris Serve CLI chat session">
+    </div>
+  </section>
+
+  <section id="observability">
+    <div class="section-head">
+      <h2>Metrics you can actually scrape</h2>
+      <p class="eyebrow-label">GET /metrics</p>
+    </div>
+    <p style="color:var(--text-muted); margin-top:-1rem; margin-bottom:1.5rem;">Enable the optional <code>metrics</code> extra and the server exposes raw Prometheus counters, gauges and histograms alongside the rolling-average JSON on <code>/api/metrics</code>. The two are not the same numbers in different clothes: the JSON averages over the last 1000 samples, a window whose <em>duration</em> moves with traffic, which is exactly what a time-series database must not be handed pre-aggregated. Below, <code>ephemeris_batch_occupancy_ratio</code> scraped every two seconds through a burst-and-idle load &mdash; each spike is the batch filling to <code>max_batch_size</code>, each trough the scheduler draining before the next burst arrives.</p>
+    <div class="shots">
+      <img src="assets/images/prometheus-metrics.png" alt="Prometheus graphing ephemeris_batch_occupancy_ratio scraped from a running Ephemeris Serve instance, showing batch occupancy cycling between 0.125 and 1.0 under a burst-and-idle load">
     </div>
   </section>
 

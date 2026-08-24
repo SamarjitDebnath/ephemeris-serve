@@ -1,5 +1,9 @@
 """Unit tests for core modules"""
 import asyncio
+import json
+import os
+import pathlib
+import time
 import torch
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
@@ -970,7 +974,13 @@ class TestApiKeyAuth:
 
         protected = {}
         for route in router.routes:
+            # A route can carry auth either as a decorator-level
+            # `dependencies=[...]` entry or as a resolved signature parameter
+            # (`token: str | None = Depends(require_api_key)`). Both enforce it;
+            # `/generate` and `/generate_batch` use the second form because the
+            # rate limiter needs the presented key as a value.
             calls = {dep.dependency for dep in route.dependencies}
+            calls |= {dep.call for dep in route.dependant.dependencies}
             for method in route.methods:
                 protected[(method, route.path)] = calls
 
@@ -979,6 +989,821 @@ class TestApiKeyAuth:
         assert require_api_key in protected[("GET", "/metrics")]
         # The model-swap route is the dangerous one: admin tier only.
         assert require_admin_api_key in protected[("POST", "/model")]
+
+    def test_generation_routes_actually_reject_a_missing_key(self, monkeypatch):
+        """Behavioral counterpart to the introspection above: shape is not
+        proof, so exercise the real dependency resolution."""
+        from fastapi.testclient import TestClient
+        from fastapi import FastAPI
+        from api.routes import router
+
+        self._configure(monkeypatch, keys="user-key", admin_keys="admin-key")
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
+
+        assert client.post("/generate", json={"prompt": "hi"}).status_code == 401
+        assert client.post(
+            "/generate_batch", json={"requests": [{"prompt": "hi"}]}
+        ).status_code == 401
+        assert client.get("/metrics").status_code == 401
+
+
+class TestPrometheusExport:
+    """Raw counters/histograms alongside the JSON, not derived from it."""
+
+    def test_every_record_call_mirrors_into_prometheus(self):
+        from metrics.metrics import BatchMetrics
+        from metrics.prometheus import prometheus_metrics
+
+        if not prometheus_metrics.available:
+            pytest.skip("prometheus-client not installed")
+
+        recorded = []
+
+        class Recorder:
+            def __init__(self, name):
+                self.name = name
+
+            def labels(self, *args):
+                return self
+
+            def observe(self, value):
+                recorded.append((self.name, "observe", value))
+
+            def set(self, value):
+                recorded.append((self.name, "set", value))
+
+            def inc(self, amount=1.0):
+                recorded.append((self.name, "inc", amount))
+
+        names = [
+            "queue_latency",
+            "token_throughput",
+            "batch_size",
+            "batch_occupancy",
+            "cache_utilization",
+            "timeout_evictions",
+            "cancelled_evictions",
+            "kv_blocks_reclaimed",
+        ]
+        originals = {name: getattr(prometheus_metrics, name) for name in names}
+        for name in names:
+            setattr(prometheus_metrics, name, Recorder(name))
+        try:
+            m = BatchMetrics(path="streaming")
+            m.record_queue_latency(0.02)
+            m.record_token_throughput(100, 2.0)
+            m.record_batch_size(4)
+            m.record_batch_occupancy(4, 8)
+            m.record_cache_utilization(2, 8)
+            m.record_timeout_eviction()
+            m.record_cancelled_eviction()
+            m.record_kv_blocks_reclaimed(5)
+        finally:
+            for name, original in originals.items():
+                setattr(prometheus_metrics, name, original)
+
+        assert {name for name, _, _ in recorded} == set(names)
+        # And the deques are still populated -- the JSON endpoint is unaffected.
+        assert m.snapshot()["average_queue_latency_ms"] == pytest.approx(20.0)
+        assert m.kv_blocks_reclaimed == 5
+
+    def test_exposition_output_parses_and_names_the_metrics(self):
+        from metrics.metrics import streaming_metrics
+        from metrics.prometheus import prometheus_metrics, render_latest
+
+        if not prometheus_metrics.available:
+            pytest.skip("prometheus-client not installed")
+
+        streaming_metrics.record_queue_latency(0.03)
+        text = render_latest().decode()
+        for name in (
+            "ephemeris_queue_latency_seconds",
+            "ephemeris_token_throughput_per_second",
+            "ephemeris_batch_size",
+        ):
+            assert name in text
+        # Exposition format: every non-comment line is `name value` or
+        # `name{labels} value`.
+        for line in text.splitlines():
+            if line and not line.startswith("#"):
+                assert " " in line
+
+    def test_latency_buckets_cover_the_observed_range(self):
+        """A histogram whose buckets all saturate still looks like data."""
+        from metrics.prometheus import _LATENCY_BUCKETS
+
+        # Sub-millisecond when idle, tens of seconds under the configured
+        # request timeout: both ends must fall inside the bucket range.
+        assert _LATENCY_BUCKETS[0] <= 0.001
+        assert _LATENCY_BUCKETS[-1] >= 60.0
+        assert list(_LATENCY_BUCKETS) == sorted(_LATENCY_BUCKETS)
+
+    def test_json_endpoint_shape_is_unchanged(self):
+        """The CLI consumes this; the Prometheus work must not disturb it."""
+        from metrics.metrics import BatchMetrics
+
+        snapshot = BatchMetrics().snapshot()
+        for key in (
+            "average_queue_latency_ms",
+            "average_batch_size",
+            "average_token_throughput_per_sec",
+            "average_batch_occupancy",
+            "average_cache_utilization",
+            "timeout_evictions",
+            "cancelled_evictions",
+        ):
+            assert key in snapshot
+
+    def test_disabled_extra_is_a_no_op(self, monkeypatch):
+        """The server must run with prometheus-client absent."""
+        import metrics.prometheus as mp
+        from metrics.metrics import BatchMetrics
+
+        monkeypatch.setattr(mp, "prometheus_metrics", mp.PrometheusMetrics.__new__(mp.PrometheusMetrics))
+        null = mp._NullMetric()
+        for name in ("queue_latency", "batch_size", "cache_utilization", "kv_blocks_reclaimed",
+                     "token_throughput", "batch_occupancy", "timeout_evictions", "cancelled_evictions"):
+            setattr(mp.prometheus_metrics, name, null)
+        monkeypatch.setattr("metrics.metrics.prometheus_metrics", mp.prometheus_metrics)
+
+        m = BatchMetrics()
+        m.record_queue_latency(0.01)
+        m.record_kv_blocks_reclaimed(2)
+        assert m.kv_blocks_reclaimed == 2
+
+    def test_render_without_the_extra_reports_it(self, monkeypatch):
+        import metrics.prometheus as mp
+
+        monkeypatch.setattr(mp, "_AVAILABLE", False)
+        monkeypatch.setattr(mp, "generate_latest", None)
+        assert b"not installed" in mp.render_latest()
+
+    def test_multiprocess_dir_is_cleared_at_startup(self, tmp_path, monkeypatch):
+        """Files left by a previous run are counted by the exporter and
+        inflate every counter."""
+        import metrics.prometheus as mp
+
+        directory = tmp_path / "promdir"
+        directory.mkdir()
+        (directory / "counter_1234.db").write_bytes(b"stale")
+        monkeypatch.setenv(mp.MULTIPROC_ENV, str(directory))
+
+        result = mp.prepare_multiprocess_dir()
+        assert result == str(directory)
+        assert list(directory.iterdir()) == []
+
+    def test_multiprocess_dir_absent_is_a_no_op(self, monkeypatch):
+        import metrics.prometheus as mp
+
+        monkeypatch.delenv(mp.MULTIPROC_ENV, raising=False)
+        assert mp.prepare_multiprocess_dir() is None
+
+    def test_multiprocess_mode_aggregates_two_writers(self, tmp_path):
+        """Counters from separate processes must sum into one scrape."""
+        import subprocess
+        import sys
+
+        pytest.importorskip("prometheus_client")
+        directory = tmp_path / "promdir"
+        directory.mkdir()
+
+        writer = (
+            "import os, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from metrics.metrics import streaming_metrics\n"
+            "for _ in range(5): streaming_metrics.record_kv_blocks_reclaimed(2)\n"
+        ) % str(pathlib.Path.cwd())
+
+        env = dict(os.environ, PROMETHEUS_MULTIPROC_DIR=str(directory))
+        for _ in range(2):
+            proc = subprocess.run(
+                [sys.executable, "-c", writer], cwd=str(pathlib.Path.cwd()), env=env,
+                capture_output=True, text=True,
+            )
+            assert proc.returncode == 0, proc.stderr
+
+        reader = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from metrics.prometheus import render_latest\n"
+            "print(render_latest().decode())\n"
+        ) % str(pathlib.Path.cwd())
+        result = subprocess.run(
+            [sys.executable, "-c", reader], cwd=str(pathlib.Path.cwd()), env=env,
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+        line = next(
+            l for l in result.stdout.splitlines()
+            if l.startswith("ephemeris_kv_blocks_reclaimed_total")
+        )
+        # 2 processes x 5 calls x 2 blocks.
+        assert float(line.rsplit(" ", 1)[1]) == 20.0
+
+
+class TestModelStateCoordination:
+    """Cross-worker model-swap convergence (see scheduler/model_state.py)."""
+
+    @pytest.fixture
+    def state_dir(self, tmp_path, monkeypatch):
+        from settings.settings import scheduler_settings
+
+        monkeypatch.setattr(scheduler_settings, "model_state_dir", str(tmp_path))
+        return tmp_path
+
+    def test_disabled_by_default_is_a_complete_no_op(self, monkeypatch):
+        from scheduler import model_state
+        from settings.settings import scheduler_settings
+
+        monkeypatch.setattr(scheduler_settings, "model_state_dir", "")
+        assert model_state.enabled() is False
+        assert model_state.read_state() is None
+        assert model_state.publish_target("some/model") is None
+        assert model_state.convergence() == (0, 0)
+
+    def test_publish_then_read_round_trip(self, state_dir):
+        from scheduler import model_state
+
+        assert model_state.publish_target("a/model") == 1
+        assert model_state.read_state() == ("a/model", 1)
+
+    def test_generation_is_monotone(self, state_dir):
+        from scheduler import model_state
+
+        generations = [model_state.publish_target(f"model/{i}") for i in range(5)]
+        assert generations == [1, 2, 3, 4, 5]
+
+    def test_corrupt_state_file_is_ignored_not_raised(self, state_dir):
+        """Every worker reads this on a timer; raising would take the whole
+        pool down at once over one bad write."""
+        from scheduler import model_state
+
+        model_state.publish_target("a/model")
+        (state_dir / "model_state.json").write_text("{not json at all")
+
+        assert model_state.read_state() is None
+        assert model_state.convergence() == (0, 0)
+        # And it recovers on the next successful publish.
+        assert model_state.publish_target("b/model") == 1
+
+    def test_convergence_counts_only_workers_at_the_target(self, state_dir):
+        from scheduler import model_state
+
+        model_state.publish_target("a/model")
+        model_state.publish_target("b/model")  # generation 2
+
+        (state_dir / "worker-111.json").write_text(
+            json.dumps({"pid": 111, "generation": 2, "updated_at": time.time()})
+        )
+        (state_dir / "worker-222.json").write_text(
+            json.dumps({"pid": 222, "generation": 1, "updated_at": time.time()})
+        )
+
+        assert model_state.convergence() == (1, 2)
+
+    def test_stale_worker_files_are_reaped(self, state_dir):
+        """A crashed worker must not leave the pool reported unconverged
+        forever."""
+        from scheduler import model_state
+
+        model_state.publish_target("a/model")
+        stale = state_dir / "worker-999.json"
+        stale.write_text(json.dumps({"pid": 999, "generation": 0, "updated_at": time.time() - 10_000}))
+        (state_dir / "worker-111.json").write_text(
+            json.dumps({"pid": 111, "generation": 1, "updated_at": time.time()})
+        )
+
+        assert model_state.convergence() == (1, 1)
+        assert not stale.exists()
+
+    def test_half_written_worker_file_is_skipped(self, state_dir):
+        from scheduler import model_state
+
+        model_state.publish_target("a/model")
+        (state_dir / "worker-111.json").write_text('{"pid": 111, "gener')
+        (state_dir / "worker-222.json").write_text(
+            json.dumps({"pid": 222, "generation": 1, "updated_at": time.time()})
+        )
+        assert model_state.convergence() == (1, 1)
+
+    def test_unwritable_state_dir_degrades_instead_of_failing(self, monkeypatch, tmp_path):
+        from scheduler import model_state
+        from settings.settings import scheduler_settings
+
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("i am a file")
+        monkeypatch.setattr(scheduler_settings, "model_state_dir", str(blocker / "sub"))
+
+        assert model_state.publish_target("a/model") is None
+        assert model_state.read_state() is None
+
+    @pytest.mark.asyncio
+    async def test_follower_converges_a_second_scheduler(self, state_dir, monkeypatch):
+        """The property the whole feature exists for: a swap performed by one
+        worker reaches another on its next idle tick."""
+        from unittest.mock import AsyncMock, Mock
+        from scheduler import model_state
+        import scheduler.model_swap as swap_module
+
+        follower = Mock()
+        follower.active_requests = []
+        follower._model_generation = 0
+
+        swapped = []
+
+        async def fake_swap(name, scheduler_obj, drain_timeout):
+            swapped.append(name)
+            return name
+
+        monkeypatch.setattr(swap_module, "swap_model", fake_swap)
+        model_state.publish_target("new/model")
+
+        await swap_module.follow_model_state(follower)
+
+        assert swapped == ["new/model"]
+        assert follower._model_generation == 1
+        # And it records its convergence for the pool to see.
+        converged, known = model_state.convergence()
+        assert (converged, known) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_follower_is_idempotent_across_ticks(self, state_dir, monkeypatch):
+        from unittest.mock import Mock
+        from scheduler import model_state
+        import scheduler.model_swap as swap_module
+
+        follower = Mock()
+        follower.active_requests = []
+        follower._model_generation = 0
+        swapped = []
+
+        async def fake_swap(name, scheduler_obj, drain_timeout):
+            swapped.append(name)
+            return name
+
+        monkeypatch.setattr(swap_module, "swap_model", fake_swap)
+        model_state.publish_target("new/model")
+
+        for _ in range(5):
+            await swap_module.follow_model_state(follower)
+
+        assert swapped == ["new/model"], "a converged worker must not keep reloading"
+
+    @pytest.mark.asyncio
+    async def test_follower_that_fails_retries_on_the_next_tick(self, state_dir, monkeypatch):
+        from unittest.mock import Mock
+        from scheduler import model_state
+        import scheduler.model_swap as swap_module
+
+        follower = Mock()
+        follower.active_requests = []
+        follower._model_generation = 0
+        attempts = []
+
+        async def failing_swap(name, scheduler_obj, drain_timeout):
+            attempts.append(name)
+            raise RuntimeError("model download failed")
+
+        monkeypatch.setattr(swap_module, "swap_model", failing_swap)
+        model_state.publish_target("new/model")
+
+        await swap_module.follow_model_state(follower)
+        await swap_module.follow_model_state(follower)
+
+        assert len(attempts) == 2, "a failed follow must not report convergence"
+        assert follower._model_generation == 0
+
+    @pytest.mark.asyncio
+    async def test_coordinated_swap_publishes_only_after_a_successful_local_swap(
+        self, state_dir, monkeypatch
+    ):
+        """Publishing a target this worker then failed to load would send every
+        other worker chasing a broken model name."""
+        from unittest.mock import Mock
+        from scheduler import model_state
+        import scheduler.model_swap as swap_module
+
+        async def failing_swap(name, scheduler_obj, drain_timeout):
+            raise RuntimeError("bad repo id")
+
+        monkeypatch.setattr(swap_module, "swap_model", failing_swap)
+        with pytest.raises(RuntimeError):
+            await swap_module.swap_model_coordinated("bad/model", Mock(), 1.0)
+
+        assert model_state.read_state() is None
+
+    def test_generation_is_monotone_across_real_processes(self, state_dir):
+        """`flock` semantics cannot be tested with threads."""
+        import subprocess
+        import sys
+
+        script = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from settings.settings import scheduler_settings\n"
+            "scheduler_settings.model_state_dir = %r\n"
+            "from scheduler import model_state\n"
+            "for _ in range(20): model_state.publish_target('m')\n"
+        ) % (str(pathlib.Path.cwd()), str(state_dir))
+
+        procs = [
+            subprocess.Popen([sys.executable, "-c", script], cwd=str(pathlib.Path.cwd()))
+            for _ in range(4)
+        ]
+        for proc in procs:
+            assert proc.wait(timeout=120) == 0
+
+        from scheduler import model_state
+
+        state = model_state.read_state()
+        assert state is not None
+        # No lost updates: 4 processes x 20 publishes.
+        assert state[1] == 80
+
+
+class TestPriorityRequestQueue:
+    """Fairness between short and long requests, in both directions."""
+
+    def _request(self, max_tokens, enqueue_time=None):
+        from scheduler.request import InferenceRequest
+
+        req = InferenceRequest(prompt="p", max_tokens=max_tokens, temperature=0.0)
+        if enqueue_time is not None:
+            req.enqueue_time = enqueue_time
+        return req
+
+    @pytest.mark.asyncio
+    async def test_short_requests_are_served_before_long_ones(self):
+        from scheduler.request_queue import PriorityRequestQueue
+
+        queue = PriorityRequestQueue()
+        now = time.monotonic()
+        long_req = self._request(2048, enqueue_time=now)
+        short_req = self._request(16, enqueue_time=now)
+
+        # Long one arrives first; the short one should still come out first.
+        await queue.put(long_req)
+        await queue.put(short_req)
+
+        assert await queue.get() is short_req
+        assert await queue.get() is long_req
+
+    @pytest.mark.asyncio
+    async def test_fifo_is_preserved_within_a_class(self):
+        from scheduler.request_queue import PriorityRequestQueue
+
+        queue = PriorityRequestQueue()
+        now = time.monotonic()
+        first = self._request(16, enqueue_time=now)
+        second = self._request(16, enqueue_time=now + 0.001)
+        third = self._request(16, enqueue_time=now + 0.002)
+        for req in (first, second, third):
+            await queue.put(req)
+
+        assert [await queue.get() for _ in range(3)] == [first, second, third]
+
+    @pytest.mark.asyncio
+    async def test_aging_promotes_a_long_request_over_a_new_short_one(self, monkeypatch):
+        """The anti-starvation property. Without it, continuous short traffic
+        keeps long requests queued forever."""
+        from scheduler.request_queue import PriorityRequestQueue
+        from settings.settings import scheduler_settings
+
+        monkeypatch.setattr(scheduler_settings, "priority_aging_seconds", 10.0)
+        queue = PriorityRequestQueue()
+        now = time.monotonic()
+
+        # Waited well past the aging window.
+        old_long = self._request(2048, enqueue_time=now - 60.0)
+        fresh_short = self._request(16, enqueue_time=now)
+        await queue.put(old_long)
+        await queue.put(fresh_short)
+
+        assert await queue.get() is old_long
+
+    @pytest.mark.asyncio
+    async def test_a_barely_waited_long_request_does_not_jump_the_queue(self, monkeypatch):
+        from scheduler.request_queue import PriorityRequestQueue
+        from settings.settings import scheduler_settings
+
+        monkeypatch.setattr(scheduler_settings, "priority_aging_seconds", 10.0)
+        queue = PriorityRequestQueue()
+        now = time.monotonic()
+
+        recent_long = self._request(2048, enqueue_time=now - 1.0)
+        fresh_short = self._request(16, enqueue_time=now)
+        await queue.put(recent_long)
+        await queue.put(fresh_short)
+
+        assert await queue.get() is fresh_short
+
+    @pytest.mark.asyncio
+    async def test_ordering_does_not_drift_with_wall_clock(self, monkeypatch):
+        """The sort key is fixed at push time because the aging term cancels
+        between any two requests. Popping later must not reorder them."""
+        from scheduler.request_queue import PriorityRequestQueue
+        from settings.settings import scheduler_settings
+
+        monkeypatch.setattr(scheduler_settings, "priority_aging_seconds", 10.0)
+        queue = PriorityRequestQueue()
+        now = time.monotonic()
+        long_req = self._request(2048, enqueue_time=now - 60.0)
+        short_req = self._request(16, enqueue_time=now)
+        await queue.put(long_req)
+        await queue.put(short_req)
+
+        # Pretend a long time passed between push and pop.
+        monkeypatch.setattr(
+            "scheduler.request_queue.time.monotonic", lambda: now + 3600.0
+        )
+        assert await queue.get() is long_req
+        assert await queue.get() is short_req
+
+    @pytest.mark.asyncio
+    async def test_empty_reflects_every_class(self):
+        """`scheduler/model_swap.py` drains on this -- a queue that reports
+        empty while holding one class would let a swap proceed too early."""
+        from scheduler.request_queue import PriorityRequestQueue
+
+        queue = PriorityRequestQueue()
+        assert queue.empty() is True
+        await queue.put(self._request(16))
+        assert queue.empty() is False
+        await queue.get()
+        assert queue.empty() is True
+
+    @pytest.mark.asyncio
+    async def test_get_blocks_until_a_request_arrives(self):
+        """`get()` must be a real awaitable that blocks, not a poller -- the
+        scheduler wraps it in `asyncio.wait_for`."""
+        from scheduler.request_queue import PriorityRequestQueue
+
+        queue = PriorityRequestQueue()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(queue.get(), timeout=0.05)
+
+        # And still works normally afterwards.
+        req = self._request(16)
+        await queue.put(req)
+        assert await asyncio.wait_for(queue.get(), timeout=1.0) is req
+
+    @pytest.mark.asyncio
+    async def test_batch_queue_stays_fifo(self):
+        """Batch responses are returned in request order; reordering there
+        would only make the output surprising."""
+        from scheduler.request_queue import RequestQueue
+
+        queue = RequestQueue()
+        long_req = self._request(2048)
+        short_req = self._request(16)
+        await queue.put(long_req)
+        await queue.put(short_req)
+        assert await queue.get() is long_req
+
+
+class TestReservedSlotAdmission:
+    """A short request must not wait for a long generation to *finish*."""
+
+    def _scheduler(self, max_batch_size=8):
+        from unittest.mock import Mock
+        from scheduler.continuous_scheduler import ContinuousScheduler
+
+        return ContinuousScheduler(Mock(), Mock(), max_batch_size=max_batch_size)
+
+    def _request(self, max_tokens):
+        from scheduler.request import InferenceRequest
+
+        return InferenceRequest(prompt="p", max_tokens=max_tokens, temperature=0.0)
+
+    def test_general_lane_cannot_take_the_reserved_slots(self, monkeypatch):
+        from settings.settings import scheduler_settings
+        from scheduler.request import GENERAL_REQUEST_CLASS, SHORT_REQUEST_CLASS
+
+        monkeypatch.setattr(scheduler_settings, "short_lane_reserved_slots", 2)
+        scheduler = self._scheduler(max_batch_size=8)
+
+        assert scheduler._admission_limit_for(GENERAL_REQUEST_CLASS) == 6
+        # Short requests may use the whole batch, reserved slots included.
+        assert scheduler._admission_limit_for(SHORT_REQUEST_CLASS) == 8
+
+    def test_short_lane_has_room_when_the_general_lane_is_saturated(self, monkeypatch):
+        from settings.settings import scheduler_settings
+        from scheduler.request import GENERAL_REQUEST_CLASS, SHORT_REQUEST_CLASS
+
+        monkeypatch.setattr(scheduler_settings, "short_lane_reserved_slots", 2)
+        scheduler = self._scheduler(max_batch_size=8)
+        scheduler.active_requests = [self._request(2048) for _ in range(6)]
+
+        # General lane is full at its cap of 6...
+        assert scheduler._active_count_for(GENERAL_REQUEST_CLASS) == 6
+        assert scheduler._active_count_for(
+            GENERAL_REQUEST_CLASS
+        ) >= scheduler._admission_limit_for(GENERAL_REQUEST_CLASS)
+        # ...but a short request still fits.
+        assert scheduler._active_count_for(
+            SHORT_REQUEST_CLASS
+        ) < scheduler._admission_limit_for(SHORT_REQUEST_CLASS)
+
+    def test_reservation_never_starves_the_batch_entirely(self, monkeypatch):
+        """A misconfigured reservation larger than the batch must still leave
+        the general lane able to run, or long requests would never start."""
+        from settings.settings import scheduler_settings
+        from scheduler.request import GENERAL_REQUEST_CLASS
+
+        monkeypatch.setattr(scheduler_settings, "short_lane_reserved_slots", 99)
+        scheduler = self._scheduler(max_batch_size=4)
+        assert scheduler._admission_limit_for(GENERAL_REQUEST_CLASS) == 1
+
+
+class TestRateLimiter:
+    """Token-bucket throttling. Time is always monkeypatched -- never slept."""
+
+    @pytest.fixture
+    def limiter(self, monkeypatch):
+        import api.ratelimit as rl
+        from settings.settings import rate_limit_settings
+
+        monkeypatch.setattr(rate_limit_settings, "enabled", True)
+        monkeypatch.setattr(rate_limit_settings, "requests_per_second", 2.0)
+        monkeypatch.setattr(rate_limit_settings, "burst", 3)
+        monkeypatch.setattr(rate_limit_settings, "max_concurrent_requests", 2)
+        instance = rl.RateLimiter()
+        # `release_after` and `rate_limited` reach for the module-level
+        # singleton, so substituting it is what makes those paths testable at
+        # all -- and what keeps this class from leaking state into the process
+        # limiter the routes use.
+        monkeypatch.setattr(rl, "limiter", instance)
+        return instance
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        import api.ratelimit as rl
+
+        class Clock:
+            now = 1000.0
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        c = Clock()
+        monkeypatch.setattr(rl.time, "monotonic", lambda: c.now)
+        return c
+
+    @pytest.mark.asyncio
+    async def test_burst_then_reject(self, limiter, clock):
+        from fastapi import HTTPException
+
+        for _ in range(3):
+            await limiter.acquire("key:a")
+            await limiter.release("key:a")
+
+        with pytest.raises(HTTPException) as excinfo:
+            await limiter.acquire("key:a")
+        assert excinfo.value.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_refills_at_the_configured_rate(self, limiter, clock):
+        from fastapi import HTTPException
+
+        for _ in range(3):
+            await limiter.acquire("key:a")
+            await limiter.release("key:a")
+        with pytest.raises(HTTPException):
+            await limiter.acquire("key:a")
+
+        # 2 req/s, so half a second buys exactly one token.
+        clock.advance(0.5)
+        await limiter.acquire("key:a")
+        await limiter.release("key:a")
+        with pytest.raises(HTTPException):
+            await limiter.acquire("key:a")
+
+    @pytest.mark.asyncio
+    async def test_buckets_are_independent_per_identity(self, limiter, clock):
+        from fastapi import HTTPException
+
+        for _ in range(3):
+            await limiter.acquire("key:a")
+            await limiter.release("key:a")
+        with pytest.raises(HTTPException):
+            await limiter.acquire("key:a")
+
+        # A second tenant is untouched by the first one's spending.
+        await limiter.acquire("key:b")
+
+    @pytest.mark.asyncio
+    async def test_retry_after_matches_the_refill_arithmetic(self, limiter, clock):
+        from fastapi import HTTPException
+
+        for _ in range(3):
+            await limiter.acquire("key:a")
+            await limiter.release("key:a")
+        with pytest.raises(HTTPException) as excinfo:
+            await limiter.acquire("key:a")
+
+        retry_after = excinfo.value.headers["Retry-After"]
+        # One token at 2/s is 0.5s, ceiled to a whole second. Never 0 -- that
+        # would invite an immediate retry that fails again.
+        assert retry_after == "1"
+        assert int(retry_after) >= 1
+
+    @pytest.mark.asyncio
+    async def test_concurrency_cap_is_independent_of_rate(self, limiter, clock, monkeypatch):
+        from fastapi import HTTPException
+        from settings.settings import rate_limit_settings
+
+        # Plenty of rate budget; the cap is what should bind.
+        monkeypatch.setattr(rate_limit_settings, "burst", 100)
+        await limiter.acquire("key:a")
+        await limiter.acquire("key:a")
+        with pytest.raises(HTTPException) as excinfo:
+            await limiter.acquire("key:a")
+        assert "concurrent" in excinfo.value.detail.lower()
+
+        await limiter.release("key:a")
+        await limiter.acquire("key:a")
+
+    @pytest.mark.asyncio
+    async def test_slot_is_returned_on_the_error_path(self, limiter, clock, monkeypatch):
+        """A limiter that leaks a slot on failure locks a tenant out for good."""
+        from fastapi import HTTPException
+        from settings.settings import rate_limit_settings
+        from api.ratelimit import rate_limited
+
+        monkeypatch.setattr(rate_limit_settings, "burst", 100)
+        request = Mock()
+        request.client.host = "10.0.0.1"
+
+        for _ in range(5):
+            with pytest.raises(RuntimeError):
+                async with rate_limited(request, token="a-key"):
+                    raise RuntimeError("handler blew up")
+
+        # Five failures must not have consumed the two concurrency slots.
+        await limiter.acquire("key:a-key")
+
+    @pytest.mark.asyncio
+    async def test_batch_cost_is_the_sub_request_count(self, limiter, clock):
+        from fastapi import HTTPException
+
+        # Burst is 3; a batch of 3 spends it in one call.
+        await limiter.acquire("key:a", cost=3)
+        await limiter.release("key:a")
+        with pytest.raises(HTTPException):
+            await limiter.acquire("key:a", cost=1)
+
+    @pytest.mark.asyncio
+    async def test_release_after_frees_the_slot_when_the_stream_ends(self, limiter, clock):
+        from api.ratelimit import release_after
+
+        async def stream():
+            yield "a"
+            yield "b"
+
+        await limiter.acquire("key:a")
+        chunks = [chunk async for chunk in release_after(stream(), "key:a")]
+        assert chunks == ["a", "b"]
+        # Slot returned: two more acquisitions fit under the cap of 2.
+        await limiter.acquire("key:a")
+        await limiter.acquire("key:a")
+
+    @pytest.mark.asyncio
+    async def test_release_after_frees_the_slot_when_the_stream_raises(self, limiter, clock):
+        from api.ratelimit import release_after
+
+        async def stream():
+            yield "a"
+            raise RuntimeError("client vanished")
+
+        await limiter.acquire("key:a")
+        with pytest.raises(RuntimeError):
+            async for _ in release_after(stream(), "key:a"):
+                pass
+        await limiter.acquire("key:a")
+        await limiter.acquire("key:a")
+
+    @pytest.mark.asyncio
+    async def test_disabled_is_a_complete_no_op(self, clock, monkeypatch):
+        from api.ratelimit import RateLimiter
+        from settings.settings import rate_limit_settings
+
+        monkeypatch.setattr(rate_limit_settings, "enabled", False)
+        limiter = RateLimiter()
+        for _ in range(1000):
+            await limiter.acquire("key:a")
+        assert limiter._buckets == {}
+
+    def test_identity_prefers_the_api_key_over_the_address(self):
+        from api.ratelimit import identity_for
+
+        request = Mock()
+        request.client.host = "10.0.0.1"
+        assert identity_for("secret", request) == "key:secret"
+        assert identity_for(None, request) == "ip:10.0.0.1"
+        request.client = None
+        assert identity_for(None, request) == "ip:unknown"
 
 
 class TestSecretSettingTolerance:
@@ -1465,6 +2290,13 @@ class TestPagedKVCache:
         assert req_a.block_ids == []
         assert req_a.length == 0
 
+        # Reclaim the free tail while req_b is still live. Only blocks that
+        # were already on the free list go away, so req_b's view below must be
+        # bit-identical to what it would have been without this call.
+        reclaimed = cache.trim_tail(min_capacity=2)
+        assert reclaimed == 2
+        assert cache.capacity == 2
+
         req_c = BlockTable()
         c_keys, c_values = self._kv_step(cache, n_tokens=4, fill_value=3)
         cache.append(req_c, c_keys, c_values)
@@ -1509,6 +2341,103 @@ class TestPagedKVCache:
         for i in range(10):
             assert torch.equal(gathered_k[0][i], torch.full((cache.num_kv_heads, 4, cache.head_dim), float(i)))
 
+    def test_allocate_takes_the_lowest_free_block(self):
+        """Allocation is min-heap ordered, not LIFO -- live blocks must cluster
+        at the bottom of the pool, which is what keeps the tail trimmable."""
+        from cache.paged_kv_cache import BlockTable
+
+        cache = self._make_cache(block_size=4)
+        tables = []
+        for i in range(3):
+            table = BlockTable()
+            keys, values = self._kv_step(cache, n_tokens=4, fill_value=i)
+            cache.append(table, keys, values)
+            tables.append(table)
+        assert [t.block_ids for t in tables] == [[0], [1], [2]]
+
+        # Free the middle block, then allocate again: the hole gets filled
+        # before the untouched high index does.
+        cache.free(tables[1])
+        reused = BlockTable()
+        keys, values = self._kv_step(cache, n_tokens=4, fill_value=9)
+        cache.append(reused, keys, values)
+        assert reused.block_ids == [1]
+
+    def test_trim_tail_shrinks_the_pool_tensors(self):
+        """A trim must release storage, not just lower a counter."""
+        cache = self._make_cache(block_size=4)
+        assert cache.capacity == 4
+
+        reclaimed = cache.trim_tail(min_capacity=1)
+        assert reclaimed == 3
+        assert cache.capacity == 1
+        # RSS is not assertable in-process; the tensor shape is.
+        for layer_idx in range(cache.num_layers):
+            assert cache.key_pool[layer_idx].shape[0] == 1
+            assert cache.value_pool[layer_idx].shape[0] == 1
+        # The free list is still a valid heap over the surviving blocks only.
+        assert sorted(cache.free_blocks) == [0]
+
+    def test_trim_tail_is_a_noop_when_the_tail_is_occupied(self):
+        """A live block at the top of the pool blocks the trim -- nothing that
+        a `BlockTable` still points at may be dropped."""
+        from cache.paged_kv_cache import BlockTable
+
+        cache = self._make_cache(block_size=4)
+        tables = []
+        for i in range(4):
+            table = BlockTable()
+            keys, values = self._kv_step(cache, n_tokens=4, fill_value=i)
+            cache.append(table, keys, values)
+            tables.append(table)
+        assert cache.free_blocks == []
+
+        assert cache.trim_tail(min_capacity=1) == 0
+        assert cache.capacity == 4
+
+        # Freeing a middle block is not enough: the highest block is still live.
+        cache.free(tables[1])
+        assert cache.trim_tail(min_capacity=1) == 0
+        assert cache.capacity == 4
+
+    def test_trim_tail_never_drops_below_min_capacity(self):
+        cache = self._make_cache(block_size=4)
+        assert cache.capacity == 4
+
+        assert cache.trim_tail(min_capacity=3) == 1
+        assert cache.capacity == 3
+        # Already at or below the floor: nothing more to give.
+        assert cache.trim_tail(min_capacity=3) == 0
+        assert cache.trim_tail(min_capacity=4) == 0
+        assert cache.capacity == 3
+
+    def test_trim_tail_leaves_a_live_request_readable(self):
+        """The point of the whole design: trimming is safe mid-generation."""
+        from cache.paged_kv_cache import BlockTable
+
+        cache = self._make_cache(block_size=4)
+        live = BlockTable()
+        keys, values = self._kv_step(cache, n_tokens=6, fill_value=7)
+        cache.append(live, keys, values)
+        assert live.block_ids == [0, 1]
+
+        before, _, _ = cache.gather_dense([live])
+        assert cache.trim_tail(min_capacity=1) == 2
+        assert cache.capacity == 2
+        assert cache.is_valid(live) is True
+
+        after, _, real_lengths = cache.gather_dense([live])
+        assert real_lengths == [6]
+        for layer_idx in range(cache.num_layers):
+            assert torch.equal(after[layer_idx], before[layer_idx])
+
+        # And the request can keep generating into the trimmed pool.
+        more_keys, more_values = self._kv_step(cache, n_tokens=2, fill_value=8)
+        cache.append(live, more_keys, more_values)
+        assert live.length == 8
+        grown, _, _ = cache.gather_dense([live])
+        assert torch.equal(grown[0][0, :, -2:, :], more_keys[0])
+
 
 def _run_scheduler_step(scheduler, engine):
     """Run one `_prepare_batch`/`forward_step`/`_dispatch_tokens` cycle, greedily
@@ -1538,6 +2467,105 @@ def _make_scheduler_request(prompt, engine, tokenizer_service):
     encoded = tokenizer_service.encode(req.prompt, return_tensors=True)
     req.input_ids = encoded["input_ids"].to(engine.device)
     return req
+
+
+class TestPerRequestSamplingParams:
+    """`top_k`/`top_p` must travel with the request, like `temperature` already does."""
+
+    def test_schema_rejects_out_of_range_values(self):
+        from pydantic import ValidationError
+        from schemas.schemas import GenerateRequest
+
+        # top_p of exactly 0 would filter every token; caught at the edge
+        # rather than surfacing as an empty distribution mid-generation.
+        with pytest.raises(ValidationError):
+            GenerateRequest(prompt="hi", top_p=0.0)
+        with pytest.raises(ValidationError):
+            GenerateRequest(prompt="hi", top_p=1.5)
+        with pytest.raises(ValidationError):
+            GenerateRequest(prompt="hi", top_k=-1)
+
+    def test_schema_accepts_the_disabling_sentinels(self):
+        from schemas.schemas import GenerateRequest
+
+        req = GenerateRequest(prompt="hi", top_k=0, top_p=1.0)
+        assert req.top_k == 0
+        assert req.top_p == 1.0
+
+    def test_omitted_values_fall_back_to_config(self):
+        from scheduler.request import InferenceRequest
+        from settings.settings import model_settings
+
+        req = InferenceRequest(prompt="hi", max_tokens=8, temperature=0.5)
+        assert req.top_k == model_settings.top_k
+        assert req.top_p == model_settings.top_p
+
+    def test_explicit_zero_top_k_is_preserved(self):
+        """`top_k=0` means "filtering off", not "unset" -- the falsy-default bug."""
+        from scheduler.request import InferenceRequest
+        from settings.settings import model_settings
+
+        req = InferenceRequest(prompt="hi", max_tokens=8, temperature=0.5, top_k=0, top_p=1.0)
+        assert req.top_k == 0
+        assert req.top_p == 1.0
+        # Only meaningful if the config default is not itself 0.
+        assert model_settings.top_k != 0
+
+    def test_scheduler_samples_with_each_requests_own_values(self):
+        """Two requests in one batch must reach `sample()` with different values."""
+        from unittest.mock import Mock
+        from scheduler.continuous_scheduler import ContinuousScheduler
+        from scheduler.request import InferenceRequest
+
+        engine = Mock()
+        engine.forward_step.return_value = (torch.zeros(2, 4), None)
+        engine.apply_repetition_penalty.side_effect = lambda logits, histories: logits
+        engine.sample.return_value = torch.tensor([[7]])
+
+        scheduler = ContinuousScheduler(engine, Mock(), max_batch_size=2)
+        first = InferenceRequest(prompt="a", max_tokens=4, temperature=0.1, top_k=3, top_p=0.5)
+        second = InferenceRequest(prompt="b", max_tokens=4, temperature=0.2, top_k=9, top_p=0.9)
+        for req in (first, second):
+            req.input_ids = torch.tensor([[1, 2, 3]])
+
+        batch_inputs = Mock()
+        batch_inputs.input_ids = torch.tensor([[1], [1]])
+        batch_inputs.attention_mask = torch.ones(2, 1)
+        batch_inputs.position_ids = torch.zeros(2, 1, dtype=torch.long)
+        batch_inputs.logit_gather_indices = torch.zeros(2, dtype=torch.long)
+        batch_inputs.past_key_values = None
+
+        scheduler._forward_and_sample(batch_inputs, [first, second])
+
+        passed = [(call.args[2], call.args[3]) for call in engine.sample.call_args_list]
+        assert passed == [(3, 0.5), (9, 0.9)]
+
+    @pytest.mark.asyncio
+    async def test_generate_batch_samples_with_each_requests_own_values(self):
+        from unittest.mock import Mock, patch
+        from engine.generator import InferenceEngine
+        from scheduler.request import InferenceRequest
+
+        engine = InferenceEngine()
+        engine.device = "cpu"
+        model_output = Mock()
+        model_output.logits = torch.zeros(2, 1, 4)
+        model_output.past_key_values = None
+        # `model` is a lazily-loading property; set the backing field so no
+        # real weights are fetched.
+        engine._model = Mock(return_value=model_output)
+        engine._model.config.eos_token_id = 99
+
+        first = InferenceRequest(prompt="a", max_tokens=1, temperature=0.1, top_k=3, top_p=0.5)
+        second = InferenceRequest(prompt="b", max_tokens=1, temperature=0.2, top_k=9, top_p=0.9)
+
+        with patch.object(engine, "sample", return_value=torch.tensor([[5]])) as sample:
+            await engine.generate_batch(
+                torch.tensor([[1, 2], [3, 4]]), torch.ones(2, 2), [first, second]
+            )
+
+        passed = [(call.args[2], call.args[3]) for call in sample.call_args_list]
+        assert passed[:2] == [(3, 0.5), (9, 0.9)]
 
 
 class TestTokenizerService:
@@ -1836,6 +2864,216 @@ class TestStreamManager:
         assert "Hello" in reconstructed
         assert "user:" not in reconstructed
         assert "this should never appear" not in reconstructed
+
+
+class TestBoundedStopDecoding:
+    """The windowed stop check must be a pure refactor of the full decode.
+
+    These are equivalence tests before they are anything else: the old code
+    decoded the entire token history every step, the new code decodes a bounded
+    tail, and the two must agree on every input that matters.
+    """
+
+    CORPUS = [
+        "Hello there user: this should never appear",
+        "Count: 1 2 3 4 5 6 7 8 9 10",
+        "答案是：42。请继续，这里还有更多的文字内容",
+        "Emoji 😊 then more 🚀 and a stop marker END trailing text",
+        "def f():\n    return 1\nUser: next turn",
+        "a" * 400 + " STOP " + "b" * 400,
+    ]
+    STOPS = [["user:"], ["4"], ["。"], ["END"], ["\nUser:"], ["STOP"]]
+
+    def _tokens(self, text):
+        from tokenizer.tokenizer_service import tokenizer_service
+
+        tokenizer_service.load()
+        return tokenizer_service.encode(text)
+
+    def _windowed_stop_text(self, tokens, stop_sequences, slack):
+        """The new path, lifted out of `_dispatch_tokens` so it can be driven
+        token by token without standing up a scheduler."""
+        from tokenizer.tokenizer_service import tokenizer_service
+        from utils.stop_sequences import find_stop_index
+
+        max_stop_length = max(len(s) for s in stop_sequences)
+        window = max_stop_length + slack
+        generated = []
+        for token in tokens:
+            generated.append(token)
+            tail_text = tokenizer_service.decode(generated[-window:])
+            if find_stop_index(tail_text, stop_sequences) is None:
+                continue
+            decoded = tokenizer_service.decode(generated)
+            stop_idx = find_stop_index(decoded, stop_sequences)
+            if stop_idx is not None:
+                return decoded[:stop_idx], len(generated)
+        return None, len(generated)
+
+    def _full_decode_stop_text(self, tokens, stop_sequences):
+        """The old path, verbatim, as the reference implementation."""
+        from tokenizer.tokenizer_service import tokenizer_service
+        from utils.stop_sequences import find_stop_index
+
+        generated = []
+        for token in tokens:
+            generated.append(token)
+            decoded = tokenizer_service.decode(generated)
+            stop_idx = find_stop_index(decoded, stop_sequences)
+            if stop_idx is not None:
+                return decoded[:stop_idx], len(generated)
+        return None, len(generated)
+
+    @pytest.mark.parametrize("index", range(6))
+    def test_windowed_matches_full_decode(self, index):
+        from settings.settings import scheduler_settings
+
+        text = self.CORPUS[index]
+        stops = self.STOPS[index]
+        tokens = self._tokens(text)
+
+        windowed = self._windowed_stop_text(tokens, stops, scheduler_settings.stop_window_slack_tokens)
+        reference = self._full_decode_stop_text(tokens, stops)
+        assert windowed == reference
+
+    def test_stop_far_past_the_window_is_still_caught(self):
+        """The window slides with generation, so a match hundreds of tokens in
+        is found exactly as one at the start would be."""
+        from settings.settings import scheduler_settings
+
+        text = "filler " * 300 + "TERMINATE and then some trailing text"
+        tokens = self._tokens(text)
+        stop_text, _ = self._windowed_stop_text(
+            tokens, ["TERMINATE"], scheduler_settings.stop_window_slack_tokens
+        )
+        assert stop_text is not None
+        assert "TERMINATE" not in stop_text
+        assert "trailing text" not in stop_text
+
+    def test_stop_longer_than_the_slack_is_caught(self):
+        """Window size is driven by the stop sequence, not by the constant --
+        a stop longer than the slack must still be detected."""
+        long_stop = "THIS-IS-A-VERY-LONG-STOP-SEQUENCE-INDEED"
+        text = f"lead in {long_stop} trailing"
+        tokens = self._tokens(text)
+        # Slack of zero: the window is exactly the stop's character length.
+        stop_text, _ = self._windowed_stop_text(tokens, [long_stop], 0)
+        assert stop_text is not None
+        assert long_stop not in stop_text
+        assert "trailing" not in stop_text
+
+    def test_no_stop_sequences_skips_the_check_entirely(self):
+        """`_dispatch_tokens` guards on `req.stop_sequences`, so a request
+        without them never enters the decode path at all."""
+        req = self._make_request(stop_sequences=None)
+        assert req.stop_sequences == []
+        assert req.max_stop_length == 0
+
+    def _make_request(self, stop_sequences):
+        from scheduler.request import InferenceRequest
+
+        return InferenceRequest(
+            prompt="p", max_tokens=8, temperature=0.0, stop_sequences=stop_sequences
+        )
+
+    def test_max_stop_length_is_cached_on_the_request(self):
+        req = self._make_request(["ab", "abcdef", "abc"])
+        assert req.max_stop_length == 6
+
+
+class TestIncrementalDetokenization:
+    """`stream_response` must emit the same text as a full-history decode."""
+
+    async def _stream(self, text, stop_sequences=None):
+        from streaming.stream_manager import stream_response
+        from scheduler.request import InferenceRequest
+        from tokenizer.tokenizer_service import tokenizer_service
+
+        tokenizer_service.load()
+        tokens = tokenizer_service.encode(text)
+        req = InferenceRequest(
+            prompt="p", max_tokens=1000, temperature=0.0, stop_sequences=stop_sequences
+        )
+        for token in tokens:
+            req.queue.put_nowait(token)
+        req.queue.put_nowait("[DONE]")
+
+        chunks = []
+        async for chunk in stream_response(req):
+            chunks.append(chunk)
+        return "".join(chunks), tokens
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "The quick brown fox jumps over the lazy dog",
+            "答案是四十二，这是一段中文文本，用于测试多字节字符的解码",
+            "Mixed 😊 emoji 🚀 and ASCII text together",
+            "short",
+        ],
+    )
+    async def test_output_matches_a_full_history_decode(self, text):
+        from tokenizer.tokenizer_service import tokenizer_service
+
+        emitted, tokens = await self._stream(text)
+        full = tokenizer_service.decode(tokens)
+
+        # The buffering heuristic can withhold a trailing partial delta, so the
+        # emitted text is a prefix of the full decode -- never different from it.
+        assert full.startswith(emitted)
+        assert "\ufffd" not in emitted
+        # Nothing meaningful should be withheld beyond the final partial chunk.
+        assert len(full) - len(emitted) <= 16
+
+    @pytest.mark.asyncio
+    async def test_multi_byte_character_split_across_tokens_is_not_corrupted(self):
+        emitted, _ = await self._stream("😊🚀🎉 done")
+        assert "\ufffd" not in emitted
+
+    @pytest.mark.asyncio
+    async def test_stop_sequence_still_trims_the_stream(self):
+        emitted, _ = await self._stream(
+            "Hello there user: this should never appear", stop_sequences=["user:"]
+        )
+        assert "Hello" in emitted
+        assert "user:" not in emitted
+        assert "this should never appear" not in emitted
+
+    @pytest.mark.asyncio
+    async def test_stop_sequence_far_into_a_long_stream_is_caught(self):
+        """The narrowed stop search only looks at the newly-decoded region; a
+        match hundreds of characters in must still terminate the stream."""
+        emitted, _ = await self._stream(
+            "filler words here " * 40 + "TERMINATE trailing", stop_sequences=["TERMINATE"]
+        )
+        assert "TERMINATE" not in emitted
+        assert "trailing" not in emitted
+        assert "filler" in emitted
+
+    @pytest.mark.asyncio
+    async def test_decode_calls_stay_bounded(self):
+        """The point of the change: decoded span must not grow with stream length."""
+        from tokenizer.tokenizer_service import tokenizer_service
+        import streaming.stream_manager as sm
+
+        spans = []
+        original = tokenizer_service.decode
+
+        def recording_decode(tokens):
+            if isinstance(tokens, list):
+                spans.append(len(tokens))
+            return original(tokens)
+
+        tokenizer_service.decode = recording_decode
+        try:
+            await self._stream("The quick brown fox jumps over the lazy dog. " * 20)
+        finally:
+            tokenizer_service.decode = original
+
+        assert spans, "expected decode to be called"
+        # Whole-history decoding would put the largest span at the token count.
+        assert max(spans) <= 8, f"decode span grew to {max(spans)}"
 
 
 class TestAPIStructure:

@@ -1,13 +1,25 @@
-"""Latency and performance benchmarks for the inference server"""
+"""Latency and performance benchmarks for the inference server.
+
+The prompt-driven benchmarks here are declarative: cases live in
+`tests/scenarios.yaml` (see TESTING.md), `tests/conftest.py` expands them into
+one pytest case each, and `tests/report.py` renders the measurements as
+markdown. Adding a benchmark does not require editing this file.
+
+The tests that remain hand-written are the ones that are not a
+prompt-plus-threshold shape -- queue latency, degradation over time, and
+memory growth -- where the assertion is about a trend rather than a number.
+"""
 import asyncio
 import time
 import statistics
 import pytest
-from typing import List
+from typing import List, Sequence
 from dataclasses import dataclass
 from unittest.mock import Mock
 
 from logger import setup_logger
+from tests import report as report_module
+from tests.scenarios import Scenario
 
 logger = setup_logger(__name__, level="INFO")
 
@@ -24,118 +36,69 @@ class LatencyMetrics:
     p99_ms: float
 
 
+def measure_latency(func, *args, **kwargs) -> float:
+    """Measure execution time in milliseconds"""
+    start = time.perf_counter()
+    result = func(*args, **kwargs)
+    end = time.perf_counter()
+    return (end - start) * 1000  # Convert to ms
+
+
+async def measure_latency_async(coro) -> float:
+    """Measure async execution time in milliseconds"""
+    start = time.perf_counter()
+    await coro
+    end = time.perf_counter()
+    return (end - start) * 1000  # Convert to ms
+
+
+def analyze_latencies(latencies: List[float]) -> LatencyMetrics:
+    """Analyze a list of latency measurements"""
+    latencies_sorted = sorted(latencies)
+    n = len(latencies_sorted)
+    p95_idx = int(n * 0.95)
+    p99_idx = int(n * 0.99)
+
+    return LatencyMetrics(
+        min_ms=min(latencies),
+        max_ms=max(latencies),
+        mean_ms=statistics.mean(latencies),
+        median_ms=statistics.median(latencies),
+        stdev_ms=statistics.stdev(latencies) if n > 1 else 0.0,
+        p95_ms=latencies_sorted[p95_idx],
+        p99_ms=latencies_sorted[p99_idx],
+    )
+
+
+def print_latency_report(name: str, metrics: LatencyMetrics):
+    """Log a formatted latency report"""
+    logger.info("%s", "\n" + "=" * 60)
+    logger.info("Latency Report: %s", name)
+    logger.info("%s", "=" * 60)
+    logger.info("  Min:     %.2f ms", metrics.min_ms)
+    logger.info("  Max:     %.2f ms", metrics.max_ms)
+    logger.info("  Mean:    %.2f ms", metrics.mean_ms)
+    logger.info("  Median:  %.2f ms", metrics.median_ms)
+    logger.info("  StdDev:  %.2f ms", metrics.stdev_ms)
+    logger.info("  P95:     %.2f ms", metrics.p95_ms)
+    logger.info("  P99:     %.2f ms", metrics.p99_ms)
+    logger.info("%s", "=" * 60)
+
+
 class TestLatencyBenchmarks:
-    """Benchmark tests for inference latency"""
+    """Benchmark tests for inference latency.
 
-    def measure_latency(self, func, *args, **kwargs) -> float:
-        """Measure execution time in milliseconds"""
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        end = time.perf_counter()
-        return (end - start) * 1000  # Convert to ms
+    The prompt-plus-threshold benchmarks that used to live here are now
+    scenarios (`tests/scenarios.yaml`, run by `TestScenarios` below). What
+    remains is the measurements that are about a trend rather than a number.
+    """
 
-    async def measure_latency_async(self, coro) -> float:
-        """Measure async execution time in milliseconds"""
-        start = time.perf_counter()
-        await coro
-        end = time.perf_counter()
-        return (end - start) * 1000  # Convert to ms
-
-    def analyze_latencies(self, latencies: List[float]) -> LatencyMetrics:
-        """Analyze a list of latency measurements"""
-        latencies_sorted = sorted(latencies)
-        n = len(latencies_sorted)
-        p95_idx = int(n * 0.95)
-        p99_idx = int(n * 0.99)
-
-        return LatencyMetrics(
-            min_ms=min(latencies),
-            max_ms=max(latencies),
-            mean_ms=statistics.mean(latencies),
-            median_ms=statistics.median(latencies),
-            stdev_ms=statistics.stdev(latencies) if n > 1 else 0.0,
-            p95_ms=latencies_sorted[p95_idx],
-            p99_ms=latencies_sorted[p99_idx],
-        )
-
-    def print_latency_report(self, name: str, metrics: LatencyMetrics):
-        """Log a formatted latency report"""
-        logger.info("%s", "\n" + "=" * 60)
-        logger.info("Latency Report: %s", name)
-        logger.info("%s", "=" * 60)
-        logger.info("  Min:     %.2f ms", metrics.min_ms)
-        logger.info("  Max:     %.2f ms", metrics.max_ms)
-        logger.info("  Mean:    %.2f ms", metrics.mean_ms)
-        logger.info("  Median:  %.2f ms", metrics.median_ms)
-        logger.info("  StdDev:  %.2f ms", metrics.stdev_ms)
-        logger.info("  P95:     %.2f ms", metrics.p95_ms)
-        logger.info("  P99:     %.2f ms", metrics.p99_ms)
-        logger.info("%s", "=" * 60)
-
-    def test_tokenizer_latency(self, test_prompt):
-        """
-        Benchmark tokenizer latency.
-        
-        Expected: < 20ms for typical prompts
-        """
-        try:
-            from tokenizer.tokenizer_service import tokenizer_service
-        except ImportError:
-            pytest.skip("Tokenizer service not available")
-
-        latencies = []
-        num_runs = 50
-
-        for _ in range(num_runs):
-            latency = self.measure_latency(
-                tokenizer_service.encode,
-                test_prompt
-            )
-            latencies.append(latency)
-
-        metrics = self.analyze_latencies(latencies)
-        self.print_latency_report("Tokenizer Encoding", metrics)
-
-        # Assertion: mean latency should be < 20ms
-        assert metrics.mean_ms < 20.0, \
-            f"Tokenizer latency too high: {metrics.mean_ms:.2f}ms (expected < 20ms)"
-
-    def test_batch_throughput(self, test_prompts):
-        """
-        Benchmark batch processing throughput.
-        
-        Simulates processing multiple prompts in sequence.
-        """
-        try:
-            from tokenizer.tokenizer_service import tokenizer_service
-        except ImportError:
-            pytest.skip("Tokenizer service not available")
-
-        batch_latencies = []
-        num_batches = 10
-
-        for _ in range(num_batches):
-            start = time.perf_counter()
-            for prompt in test_prompts:
-                tokenizer_service.encode(prompt)
-            end = time.perf_counter()
-            batch_latencies.append((end - start) * 1000)  # ms
-
-        metrics = self.analyze_latencies(batch_latencies)
-        batch_size = len(test_prompts)
-        throughput = (batch_size / (metrics.mean_ms / 1000))  # prompts per second
-
-        logger.info("%s", "\n" + "=" * 60)
-        logger.info("Batch Throughput Report")
-        logger.info("%s", "=" * 60)
-        logger.info("  Batch Size:          %d prompts", batch_size)
-        logger.info("  Mean Batch Latency:  %.2f ms", metrics.mean_ms)
-        logger.info("  Throughput:          %.1f prompts/sec", throughput)
-        logger.info("%s", "=" * 60)
-
-        # Assertion: mean batch latency should be < 50ms
-        assert metrics.mean_ms < 50.0, \
-            f"Batch latency too high: {metrics.mean_ms:.2f}ms (expected < 50ms)"
+    # Thin aliases: these were methods before the helpers were lifted to module
+    # scope for `TestScenarios` to share, and the math behind them is unchanged.
+    measure_latency = staticmethod(measure_latency)
+    measure_latency_async = staticmethod(measure_latency_async)
+    analyze_latencies = staticmethod(analyze_latencies)
+    print_latency_report = staticmethod(print_latency_report)
 
     @pytest.mark.asyncio
     async def test_batch_scheduler_queue_latency(self):
@@ -214,43 +177,146 @@ class TestLatencyBenchmarks:
         assert degradation <= max_degradation + epsilon, \
             f"Latency degradation too high: {degradation:.2f}ms (expected <= {max_degradation:.2f}ms)"
 
-    def test_concurrent_request_latency(self, test_prompts):
+
+class TestScenarios:
+    """One test per entry in the scenario file -- see `tests/scenarios.yaml`.
+
+    `tests/conftest.py` parametrizes the `scenario` fixture, so the ids here
+    are the scenario names: a failure reads `test_scenario[batch_throughput]`
+    and points straight at the YAML that produced it.
+
+    Two shapes of scenario, distinguished by which block the entry carries:
+
+    - `expect:` -- a behavioral check. Deterministic, so it always asserts.
+    - otherwise -- a latency measurement. Always recorded in the report;
+      asserted only when the scenario opts in (see
+      `Scenario.should_enforce_thresholds`), because wall-clock thresholds on
+      a shared CI runner flake, and a flaky red build trains people to ignore
+      the suite.
+    """
+
+    def test_scenario(self, scenario: Scenario, scenario_report):
+        if scenario.expect:
+            self._run_behavior(scenario, scenario_report)
+        else:
+            self._run_latency(scenario, scenario_report)
+
+    # ------------------------------------------------------------------ #
+
+    def _run_behavior(self, scenario: Scenario, scenario_report) -> None:
+        """Assert a scenario's `expect:` block against stop-sequence truncation.
+
+        This exercises `utils.stop_sequences.find_stop_index`, the same
+        function the server uses both to halt generation and to trim the stop
+        text (and everything after it) off the response -- so the check is real
+        without needing a live model.
         """
-        Benchmark latency under concurrent requests.
-        
-        Simulates multiple concurrent requests.
-        """
+        from utils.stop_sequences import find_stop_index
+
+        text = scenario.prompts[0]
+        stop_index = find_stop_index(text, scenario.stop)
+        result_text = text if stop_index is None else text[:stop_index]
+
+        failures: List[str] = []
+        needle = scenario.expect.get("contains")
+        if needle is not None and needle not in result_text:
+            failures.append(f"expected {needle!r} in output, got {result_text!r}")
+        forbidden = scenario.expect.get("not_contains")
+        if forbidden is not None and forbidden in result_text:
+            failures.append(f"expected {forbidden!r} to be absent, got {result_text!r}")
+
+        scenario_report.record(
+            report_module.ScenarioResult(
+                name=scenario.name,
+                status=report_module.status_for(failures, asserted=True),
+                tags=scenario.tags,
+                failures=failures,
+                note=f"stop={list(scenario.stop)} -> {result_text!r}",
+            )
+        )
+        assert not failures, "; ".join(failures)
+
+    def _run_latency(self, scenario: Scenario, scenario_report) -> None:
         try:
             from tokenizer.tokenizer_service import tokenizer_service
         except ImportError:
+            scenario_report.record(
+                report_module.ScenarioResult(
+                    name=scenario.name,
+                    status=report_module.STATUS_SKIPPED,
+                    tags=scenario.tags,
+                    thresholds=scenario.thresholds,
+                    note="tokenizer service not available",
+                )
+            )
             pytest.skip("Tokenizer service not available")
 
-        async def concurrent_encode():
-            tasks = [
-                asyncio.create_task(asyncio.to_thread(
-                    tokenizer_service.encode, prompt
-                ))
-                for prompt in test_prompts
-            ]
-            await asyncio.gather(*tasks)
+        # Warm up so one-time initialization is not folded into the numbers.
+        tokenizer_service.encode(scenario.prompts[0])
 
-        num_runs = 10
-        concurrent_latencies = []
+        latencies = [
+            self._measure_one_pass(scenario, tokenizer_service)
+            for _ in range(scenario.iterations)
+        ]
+        metrics = analyze_latencies(latencies)
+        print_latency_report(scenario.name, metrics)
 
-        for _ in range(num_runs):
-            latency = asyncio.run(self.measure_latency_async(concurrent_encode()))
-            concurrent_latencies.append(latency)
+        enforced = scenario.should_enforce_thresholds()
+        failures: List[str] = []
+        if enforced:
+            measured = report_module.metrics_as_dict(metrics)
+            for key, limit in sorted(scenario.thresholds.items()):
+                actual = measured[key]
+                if actual > limit:
+                    failures.append(f"{key} was {actual:.2f}ms, threshold {limit:.2f}ms")
 
-        metrics = self.analyze_latencies(concurrent_latencies)
-        concurrent_throughput = (len(test_prompts) * num_runs) / (metrics.mean_ms / 1000)
+        note = ""
+        if scenario.thresholds and not enforced:
+            note = "thresholds recorded but not asserted on this run"
+        elif scenario.is_measure_only:
+            note = "no thresholds declared -- measure only"
 
-        logger.info("%s", "\n" + "=" * 60)
-        logger.info("Concurrent Request Latency Report")
-        logger.info("%s", "=" * 60)
-        logger.info("  Concurrent Requests: %d", len(test_prompts))
-        logger.info("  Mean Latency:        %.2f ms", metrics.mean_ms)
-        logger.info("  Throughput:          %.1f prompts/sec", concurrent_throughput)
-        logger.info("%s", "=" * 60)
+        scenario_report.record(
+            report_module.ScenarioResult(
+                name=scenario.name,
+                status=report_module.status_for(failures, asserted=enforced),
+                tags=scenario.tags,
+                metrics=report_module.metrics_as_dict(metrics),
+                thresholds=scenario.thresholds,
+                enforced=enforced,
+                failures=failures,
+                note=note,
+            )
+        )
+        assert not failures, "; ".join(failures)
+
+    def _measure_one_pass(self, scenario: Scenario, tokenizer_service) -> float:
+        """Time one pass over the scenario's prompts.
+
+        `concurrency: 1` runs them in sequence; anything higher fans them out
+        over threads, which is what the old `test_concurrent_request_latency`
+        measured.
+        """
+        if scenario.concurrency <= 1:
+            return measure_latency(self._encode_all, tokenizer_service, scenario.prompts)
+        return asyncio.run(
+            measure_latency_async(self._encode_all_concurrently(tokenizer_service, scenario))
+        )
+
+    @staticmethod
+    def _encode_all(tokenizer_service, prompts: Sequence[str]) -> None:
+        for prompt in prompts:
+            tokenizer_service.encode(prompt)
+
+    @staticmethod
+    async def _encode_all_concurrently(tokenizer_service, scenario: Scenario) -> None:
+        semaphore = asyncio.Semaphore(scenario.concurrency)
+
+        async def encode(prompt: str) -> None:
+            async with semaphore:
+                await asyncio.to_thread(tokenizer_service.encode, prompt)
+
+        await asyncio.gather(*(encode(prompt) for prompt in scenario.prompts))
 
 
 class TestLoadPatterns:

@@ -476,7 +476,9 @@ def _handle_model_command(client: httpx.Client, arg: str) -> None:
         except httpx.HTTPError as exc:
             click.secho(f"[connection error] {exc}", fg="red")
             return
-        click.secho(f"Current model: {resp.json()['model_name']}", fg="cyan")
+        payload = resp.json()
+        click.secho(f"Current model: {payload['model_name']}", fg="cyan")
+        _report_swap_convergence(payload)
         return
 
     click.secho(f"Swapping model to {arg} ...", fg="cyan")
@@ -492,7 +494,30 @@ def _handle_model_command(client: httpx.Client, arg: str) -> None:
     except httpx.HTTPError as exc:
         click.secho(f"[connection error] {exc}", fg="red")
         return
-    click.secho(f"Now serving: {resp.json()['model_name']}", fg="green", bold=True)
+    payload = resp.json()
+    click.secho(f"Now serving: {payload['model_name']}", fg="green", bold=True)
+    _report_swap_convergence(payload)
+
+
+def _report_swap_convergence(payload: dict) -> None:
+    """Say how far a swap has spread across the server's worker pool.
+
+    A multi-worker server cannot swap atomically -- each worker drains its own
+    in-flight requests first -- so the server reports convergence and this
+    surfaces it. Older servers omit these fields entirely, and single-process
+    servers send them as null; both mean there is nothing to report.
+    """
+    converged = payload.get("converged_workers")
+    known = payload.get("known_workers")
+    if converged is None or known is None or known <= 1:
+        return
+    if converged >= known:
+        click.secho(f"  all {known} workers converged", fg="green")
+    else:
+        click.secho(
+            f"  {converged}/{known} workers converged -- run /model again to re-check",
+            fg="yellow",
+        )
 
 
 def _handle_creativity_command(

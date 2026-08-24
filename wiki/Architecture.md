@@ -75,7 +75,7 @@ An alternative entrypoint to `main.py`, installed via the `[project.scripts]` en
 ## Internal Control Flow Summary
 
 1. `api/routes.py` receives a validated request (checking `swap_lock` first) and creates `InferenceRequest`.
-2. The request is enqueued into `request_queue`.
+2. The request is enqueued into `request_queue`, a `PriorityRequestQueue` that orders by cost class with aging rather than strict FIFO.
 3. `ContinuousScheduler.run()` wakes up and calls `_add_new_requests()`, which applies the chat template and tokenizes.
 4. `_prepare_batch()` builds one batched step's inputs, mixing any brand-new (prefill) requests with any already mid-decode, using the paged KV cache's `gather_dense()` for the past.
 5. `InferenceEngine.forward_step()` executes the model and returns logits and the new `past_key_values`.
@@ -91,8 +91,8 @@ An alternative entrypoint to `main.py`, installed via the `[project.scripts]` en
 
 ## Request Lifecycle Summary
 
-1. Client sends `POST /api/generate` with a prompt and optional `max_tokens`/`temperature`/`stop`/`idempotency_key`.
-2. `api/routes.py` builds `InferenceRequest` and enqueues it onto `request_queue` (after checking `swap_lock` and any idempotency replay).
+1. Client sends `POST /api/generate` with a prompt and optional `max_tokens`/`temperature`/`top_k`/`top_p`/`stop`/`idempotency_key`.
+2. `api/routes.py` builds `InferenceRequest` and enqueues it onto `request_queue` (after checking `swap_lock`, any idempotency replay, and the rate limiter -- charged before enqueue so a throttled caller never occupies a scheduler slot).
 3. `ContinuousScheduler` asynchronously pulls queued requests, applies the chat template, and tokenizes.
 4. Each step, the scheduler forms a batch mixing any new prefills with any requests already mid-decode, gathering each row's cached past from the shared `PagedKVCache`.
 5. `InferenceEngine` computes logits, applies repetition penalty, and samples next tokens.

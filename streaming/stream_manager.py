@@ -14,8 +14,19 @@ async def stream_response(req: InferenceRequest) -> AsyncGenerator[Union[str, di
     """Yield decoded tokens from an ``InferenceRequest``'s streaming queue.
 
     The generator reads token IDs from ``req.queue`` until the sentinel ``"[DONE]"``
-    is received, accumulating token IDs and decoding the entire sequence to yield the
-    new text delta. This handles multi-byte character boundaries correctly.
+    is received, decoding incrementally to yield each new text delta. Multi-byte
+    character boundaries are handled correctly: a token that completes only part
+    of a character is held until the rest arrives.
+
+    Decoding is incremental rather than whole-history because ``decode`` is
+    linear in token count, so re-decoding everything per token would make a
+    stream quadratic in its own length. Two offsets bound the work: ``read_offset``
+    marks what has already been turned into text, ``prefix_offset`` trails it far
+    enough that the decode still has the context it needs to be correct at the
+    seam. ``decode`` is not decomposable -- ``decode(a + b)`` is not
+    ``decode(a) + decode(b)`` for byte-level BPE -- so the delta is taken as the
+    difference between two overlapping decodes rather than by decoding the new
+    token alone.
 
     A ``("[ERROR]", message)`` tuple sentinel (pushed when a request is evicted
     for timing out or failing server-side) yields a single SSE ``error`` event
@@ -23,6 +34,12 @@ async def stream_response(req: InferenceRequest) -> AsyncGenerator[Union[str, di
     """
     tokens = []
     yielded_text = ""
+    # Full text decoded so far, accumulated from deltas. Equivalent to
+    # decoding the whole token list every step, without paying for it.
+    decoded_text = ""
+    # Incremental detokenization offsets -- see the docstring.
+    prefix_offset = 0
+    read_offset = 0
 
     while True:
         token = await req.queue.get()
@@ -45,30 +62,48 @@ async def stream_response(req: InferenceRequest) -> AsyncGenerator[Union[str, di
             continue
 
         tokens.append(token)
-        current_text = tokenizer_service.decode(tokens)
 
-        # Strip trailing unicode replacement character (incomplete UTF-8 sequence)
-        clean_text = current_text
-        while clean_text.endswith("\ufffd"):
-            clean_text = clean_text[:-1]
+        # Two overlapping decodes; their difference is the new text. A trailing
+        # replacement character means this token only completed part of a
+        # character, so hold everything and let the next token finish it --
+        # this replaces the old strip-trailing-\ufffd loop.
+        prefix_text = tokenizer_service.decode(tokens[prefix_offset:read_offset])
+        new_text = tokenizer_service.decode(tokens[prefix_offset:])
+        if len(new_text) <= len(prefix_text) or new_text.endswith("\ufffd"):
+            logger.debug(
+                "Stream manager holding incomplete character for prompt=%s", req.prompt
+            )
+            continue
 
-        # Checked against the full decoded text (not just this token's delta)
+        new_delta = new_text[len(prefix_text):]
+        decoded_text += new_delta
+        prefix_offset = read_offset
+        read_offset = len(tokens)
+
+        # Checked against the accumulated text (not just this token's delta)
         # before any buffering decision below, so the stop sequence -- and
         # anything after it -- is never flushed to the client.
+        #
+        # Only the region a *new* match could occupy is searched: a sequence
+        # ending inside `new_delta` starts at most `max_stop_length - 1`
+        # characters before it, and anything earlier would already have
+        # matched on a previous token and returned.
         if req.stop_sequences:
-            stop_idx = find_stop_index(clean_text, req.stop_sequences)
-            if stop_idx is not None:
+            search_from = max(0, len(decoded_text) - len(new_delta) - req.max_stop_length + 1)
+            relative_idx = find_stop_index(decoded_text[search_from:], req.stop_sequences)
+            if relative_idx is not None:
+                stop_idx = search_from + relative_idx
                 if stop_idx > len(yielded_text):
-                    trimmed = clean_text[len(yielded_text):stop_idx]
+                    trimmed = decoded_text[len(yielded_text):stop_idx]
                     if trimmed:
                         yield trimmed
                 logger.debug("Stream manager hit stop sequence for prompt=%s", req.prompt)
                 return
 
-        if len(clean_text) <= len(yielded_text):
+        if len(decoded_text) <= len(yielded_text):
             continue
 
-        delta = clean_text[len(yielded_text):]
+        delta = decoded_text[len(yielded_text):]
         should_emit = delta.endswith(" ") or delta[-1] in ".,;:!?" or len(delta) >= 16
 
         if should_emit:

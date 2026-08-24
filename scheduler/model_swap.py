@@ -16,7 +16,8 @@ from engine.generator import engine
 from engine.model_loader import model_loader
 from tokenizer.tokenizer_service import tokenizer_service
 from scheduler.request_queue import request_queue, batch_request_queue
-from settings.settings import model_settings, logging_settings
+from scheduler import model_state
+from settings.settings import model_settings, logging_settings, scheduler_settings
 from utils.device_cache import empty_device_cache
 from logger import setup_logger
 
@@ -77,3 +78,71 @@ async def swap_model(new_model_name: str, continuous_scheduler, drain_timeout: f
 
         logger.info("Model swap complete: now serving '%s'", new_model_name)
         return new_model_name
+
+
+async def swap_model_coordinated(new_model_name: str, continuous_scheduler, drain_timeout: float):
+    """Swap this worker, then publish the new target for the rest of the pool.
+
+    Returns `(model_name, generation)`; `generation` is None when coordination
+    is disabled, in which case this is exactly `swap_model`.
+
+    The local swap happens first on purpose. Publishing a target this worker
+    then failed to load would leave every other worker chasing a broken model
+    name, turning one failed request into a pool-wide outage.
+    """
+    name = await swap_model(new_model_name, continuous_scheduler, drain_timeout)
+    generation = model_state.publish_target(name)
+    if generation is not None:
+        model_state.publish_worker_generation(generation, name)
+        logger.info("Published model target '%s' as generation %d", name, generation)
+    return name, generation
+
+
+async def follow_model_state(continuous_scheduler) -> None:
+    """Converge this worker on the published target, if it has fallen behind.
+
+    Called from the scheduler's idle branch, which is the one place that
+    already knows this worker has nothing in flight -- exactly the
+    precondition a swap needs. A worker still generating simply checks again
+    on its next idle tick.
+    """
+    if not model_state.enabled():
+        return
+    state = model_state.read_state()
+    if state is None:
+        return
+    target_name, target_generation = state
+
+    local = getattr(continuous_scheduler, "_model_generation", 0)
+    if target_generation <= local:
+        return
+
+    if target_name == model_settings.model_name:
+        # Already serving it (this worker performed the swap, or started with
+        # it configured). Record convergence without reloading.
+        continuous_scheduler._model_generation = target_generation
+        model_state.publish_worker_generation(target_generation, target_name)
+        return
+
+    logger.info(
+        "Following model swap to '%s' (generation %d -> %d)",
+        target_name,
+        local,
+        target_generation,
+    )
+    try:
+        # The same drain window the request-handling worker gets. A zero
+        # timeout would raise on the first tick where the queue happens to be
+        # non-empty, even though the batch itself is idle.
+        await swap_model(
+            target_name,
+            continuous_scheduler,
+            drain_timeout=scheduler_settings.model_swap_drain_timeout_seconds,
+        )
+    except Exception:
+        # Logged by `swap_model`; leave the local generation behind so the
+        # next idle tick retries rather than silently reporting convergence.
+        logger.exception("Failed to follow model swap to '%s'", target_name)
+        return
+    continuous_scheduler._model_generation = target_generation
+    model_state.publish_worker_generation(target_generation, target_name)

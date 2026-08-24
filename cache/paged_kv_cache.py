@@ -1,3 +1,4 @@
+import heapq
 from dataclasses import dataclass, field
 from typing import List, Sequence, Tuple
 
@@ -40,11 +41,22 @@ class PagedKVCache:
         self.dtype = dtype
         self.device = device
 
+        # The pool never trims below this -- it is the floor `trim_tail()`'s
+        # caller starts from, so an idle server keeps the capacity it was
+        # configured to start with rather than re-growing from nothing.
+        self.initial_capacity_blocks = max(initial_capacity_blocks, 1)
+
         self.capacity = 0
         self.key_pool: List[torch.Tensor] = []
         self.value_pool: List[torch.Tensor] = []
+        # A min-heap (see `heapq`), not a plain list: allocation always takes
+        # the *lowest* free block id, so live blocks cluster at the bottom of
+        # the pool and the tail stays contiguously free. That is what makes
+        # `trim_tail()` safe to run while requests are still generating --
+        # every block above the cut is provably on this heap, so no
+        # `BlockTable` can reference it and no live index is ever remapped.
         self.free_blocks: List[int] = []
-        self._grow_pool(max(initial_capacity_blocks, 1))
+        self._grow_pool(self.initial_capacity_blocks)
 
     def _grow_pool(self, new_blocks: int) -> None:
         for layer_idx in range(self.num_layers):
@@ -58,9 +70,14 @@ class PagedKVCache:
                 self.key_pool.append(new_k)
                 self.value_pool.append(new_v)
             else:
+                # `torch.cat` holds the old and the new pool resident at the
+                # same time, so a growth step transiently costs roughly twice
+                # the post-growth size. That spike -- not the steady-state
+                # footprint -- is the more likely OOM trigger here.
                 self.key_pool[layer_idx] = torch.cat([self.key_pool[layer_idx], new_k], dim=0)
                 self.value_pool[layer_idx] = torch.cat([self.value_pool[layer_idx], new_v], dim=0)
-        self.free_blocks.extend(range(self.capacity, self.capacity + new_blocks))
+        for block_id in range(self.capacity, self.capacity + new_blocks):
+            heapq.heappush(self.free_blocks, block_id)
         self.capacity += new_blocks
 
     def _ensure_free(self, n_blocks: int) -> None:
@@ -79,7 +96,7 @@ class PagedKVCache:
         if blocks_to_add > 0:
             self._ensure_free(blocks_to_add)
             for _ in range(blocks_to_add):
-                table.block_ids.append(self.free_blocks.pop())
+                table.block_ids.append(heapq.heappop(self.free_blocks))
 
     def append(
         self,
@@ -188,9 +205,42 @@ class PagedKVCache:
 
     def free(self, table: BlockTable) -> None:
         """Release `table`'s blocks back to the free pool and reset it to empty."""
-        self.free_blocks.extend(table.block_ids)
+        for block_id in table.block_ids:
+            heapq.heappush(self.free_blocks, block_id)
         table.block_ids = []
         table.length = 0
+
+    def trim_tail(self, min_capacity: int) -> int:
+        """Drop trailing blocks that are all free. Returns blocks reclaimed.
+
+        Safe to call with requests still in flight. The cut point is the
+        lowest index such that every block at or above it is on the free
+        list, so no live `BlockTable` can be referencing anything that goes
+        away, and nothing that survives is renumbered.
+
+        Capacity never drops below `min_capacity`; the caller owns that
+        floor (see `ContinuousScheduler._maybe_trim_kv_pool`, which derives
+        it from recent peak usage so a busy server keeps its headroom).
+        """
+        min_capacity = max(min_capacity, 1)
+        free_set = set(self.free_blocks)
+        new_capacity = self.capacity
+        while new_capacity > min_capacity and (new_capacity - 1) in free_set:
+            new_capacity -= 1
+        if new_capacity == self.capacity:
+            return 0
+
+        for layer_idx in range(self.num_layers):
+            # .clone() is required -- a plain slice is a view and keeps the
+            # full original storage alive, reclaiming nothing.
+            self.key_pool[layer_idx] = self.key_pool[layer_idx][:new_capacity].clone()
+            self.value_pool[layer_idx] = self.value_pool[layer_idx][:new_capacity].clone()
+
+        reclaimed = self.capacity - new_capacity
+        self.free_blocks = [b for b in self.free_blocks if b < new_capacity]
+        heapq.heapify(self.free_blocks)
+        self.capacity = new_capacity
+        return reclaimed
 
     def is_valid(self, table: BlockTable) -> bool:
         """Structural self-check mirroring `_is_valid_dynamic_cache`'s defensive pattern."""

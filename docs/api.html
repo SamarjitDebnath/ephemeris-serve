@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>API Reference — Ephemeris Serve</title>
-<meta name="description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health.">
+<meta name="description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health, and the Prometheus scrape endpoint.">
 <meta name="keywords" content="Ephemeris Serve API, LLM inference API, SSE streaming endpoint, REST API reference, FastAPI">
 <meta name="author" content="Samarjit Debnath">
 <meta name="robots" content="index, follow">
@@ -13,14 +13,14 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://samarjitdebnath.github.io/ephemeris-serve/api.html">
 <meta property="og:title" content="API Reference — Ephemeris Serve">
-<meta property="og:description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health.">
+<meta property="og:description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health, and the Prometheus scrape endpoint.">
 <meta property="og:image" content="https://samarjitdebnath.github.io/ephemeris-serve/assets/images/ephemeris-serve-logo.png">
 <meta property="og:site_name" content="Ephemeris Serve">
 
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:url" content="https://samarjitdebnath.github.io/ephemeris-serve/api.html">
 <meta name="twitter:title" content="API Reference — Ephemeris Serve">
-<meta name="twitter:description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health.">
+<meta name="twitter:description" content="Full endpoint reference for the Ephemeris Serve HTTP API: /generate, /generate_batch, /model, /metrics, /health, and the Prometheus scrape endpoint.">
 <meta name="twitter:image" content="https://samarjitdebnath.github.io/ephemeris-serve/assets/images/ephemeris-serve-logo.png">
 
 <link rel="icon" href="assets/images/ephemeris-serve-logo.png" type="image/png">
@@ -99,6 +99,13 @@
       </table>
       <p class="desc" style="margin-top:1rem;">Both hold a comma-separated list, so keys rotate by adding the new one before removing the old. <code>POST /api/model</code> is gated separately because it makes the server download and load an arbitrary Hugging Face repo. A missing or unrecognized key returns <code>401</code>; an ordinary key on the admin route returns <code>403</code>.</p>
       <p class="desc"><strong>With no keys configured every route is open</strong> &mdash; the local-development default. Any server reachable from outside localhost must set at least the ordinary tier.</p>
+    </div>
+
+    <h3>Rate limiting</h3>
+    <div class="endpoint">
+      <p class="desc"><code>/api/generate</code> and <code>/api/generate_batch</code> are throttled per API key &mdash; per client address when authentication is disabled &mdash; by a token bucket for request rate plus a separate cap on concurrent generations. Configured under <code>rate_limit_config</code> in <code>settings/config.yaml</code> and <strong>off by default</strong>, like authentication.</p>
+      <p class="desc">A batch is charged its sub-request count, not 1, so batching cannot be used to bypass the limit. Exceeding either limit returns <code>429</code> with a <code>Retry-After</code> header giving the seconds until the bucket refills.</p>
+      <p class="desc">The buckets live in each worker process, so a server started with <code>--workers 4</code> enforces four times the configured numbers. That is adequate for abuse prevention, not for billing-grade quota. The <code>limit_req</code> in the bundled nginx config is a complementary outer layer: it keys on client address and cannot see batch size, so neither replaces the other.</p>
       <pre><code>curl -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
   http://localhost:8000/api/metrics</code></pre>
     </div>
@@ -122,13 +129,15 @@
 
     <div class="endpoint">
       <h3><span class="method post">POST</span> /api/generate</h3>
-      <p class="desc">Enqueues an <code>InferenceRequest</code> and returns a streaming <code>text/event-stream</code> response of decoded tokens. Returns <code>503</code> while a model swap is in progress.</p>
+      <p class="desc">Enqueues an <code>InferenceRequest</code> and returns a streaming <code>text/event-stream</code> response of decoded tokens. Returns <code>503</code> while a model swap is in progress, or <code>429</code> when rate limiting is enabled and the caller is over budget.</p>
       <p><strong>Request body</strong></p>
       <table>
         <tr><th>Field</th><th>Type</th><th>Description</th></tr>
         <tr><td><code>prompt</code></td><td>string (required)</td><td>The input text for the model. Must be non-empty.</td></tr>
         <tr><td><code>max_tokens</code></td><td>integer</td><td>1–2048. Optional.</td></tr>
         <tr><td><code>temperature</code></td><td>float</td><td>0.0–2.0. Optional.</td></tr>
+        <tr><td><code>top_k</code></td><td>integer</td><td>Keep only the k highest-probability tokens. <code>0</code> disables top-k filtering. Optional; falls back to <code>model_config.top_k</code>.</td></tr>
+        <tr><td><code>top_p</code></td><td>float</td><td>Nucleus sampling mass, greater than 0 and at most 1.0. <code>1.0</code> disables top-p filtering. Optional; falls back to <code>model_config.top_p</code>.</td></tr>
         <tr><td><code>idempotency_key</code></td><td>string</td><td>Optional client-supplied key (max 200 chars) to deduplicate retried requests. A repeated key replays the cached result while the original is still in flight, or returns <code>409</code> if it's genuinely a duplicate in-flight request.</td></tr>
         <tr><td><code>stop</code></td><td>string[]</td><td>Up to 4 non-empty stop sequences; generation halts before emitting any of them.</td></tr>
       </table>
@@ -137,13 +146,13 @@
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
   -X POST \
-  -d '{"prompt":"Hello world","max_tokens":50,"temperature":0.7}' \
+  -d '{"prompt":"Hello world","max_tokens":50,"temperature":0.7,"top_k":40,"top_p":0.9}' \
   http://localhost:8000/api/generate</code></pre>
     </div>
 
     <div class="endpoint">
       <h3><span class="method post">POST</span> /api/generate_batch</h3>
-      <p class="desc">Non-streaming batched generation. Accepts one or more requests and returns aggregated text output once every item in the batch has completed. Returns <code>503</code> during a model swap, <code>504</code> on batch timeout, and <code>499</code> if the client disconnects mid-batch.</p>
+      <p class="desc">Non-streaming batched generation. Accepts one or more requests and returns aggregated text output once every item in the batch has completed. Returns <code>503</code> during a model swap, <code>504</code> on batch timeout, <code>499</code> if the client disconnects mid-batch, and <code>429</code> when rate limiting is enabled and the batch exceeds the caller's remaining budget.</p>
       <p><strong>Request body</strong></p>
       <table>
         <tr><th>Field</th><th>Type</th><th>Description</th></tr>
@@ -167,16 +176,20 @@
 
     <div class="endpoint">
       <h3><span class="method get">GET</span> /api/model</h3>
-      <p class="desc">Returns the model currently loaded and serving requests.</p>
+      <p class="desc">Returns the model this worker currently has loaded, plus how far a swap has spread across the worker pool.</p>
       <table>
         <tr><th>Field</th><th>Type</th><th>Description</th></tr>
-        <tr><td><code>model_name</code></td><td>string</td><td>Hugging Face model repo id currently loaded.</td></tr>
+        <tr><td><code>model_name</code></td><td>string</td><td>Hugging Face model repo id currently loaded by the worker that answered.</td></tr>
+        <tr><td><code>generation</code></td><td>integer | null</td><td>Monotone counter for the published model target. <code>null</code> when cross-worker coordination is disabled.</td></tr>
+        <tr><td><code>converged_workers</code></td><td>integer | null</td><td>Workers that have reached this generation.</td></tr>
+        <tr><td><code>known_workers</code></td><td>integer | null</td><td>Workers that have reported any generation. Poll until this equals <code>converged_workers</code>.</td></tr>
       </table>
     </div>
 
     <div class="endpoint">
       <h3><span class="method post">POST</span> /api/model</h3>
       <p class="desc">Hot-swaps the model this server is running without a process restart. In-flight requests are drained before the swap; <code>/api/generate</code> and <code>/api/generate_batch</code> reject with <code>503</code> for the duration. Returns <code>409</code> if a swap is already in progress, <code>504</code> if draining exceeds the timeout.</p>
+      <p class="desc">With multiple workers a swap is <strong>not atomic</strong>, and the API says so rather than hiding it: each worker drains its own in-flight requests before reloading, and those drains finish at different times. Set <code>scheduler_config.model_state_dir</code> to a path shared by every worker and the handling worker publishes a new generation that the others converge on; the response then carries <code>generation</code>, <code>converged_workers</code> and <code>known_workers</code>, and a client polls <code>GET /api/model</code> until the two counts match. Leave the setting empty and only the worker handling the request reloads.</p>
       <p><strong>Request body</strong></p>
       <table>
         <tr><th>Field</th><th>Type</th><th>Description</th></tr>
@@ -202,6 +215,27 @@
       <p style="margin-top:1rem;"><strong>Example</strong></p>
       <pre><code>curl -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
   http://localhost:8000/api/metrics</code></pre>
+    </div>
+
+    <div class="endpoint">
+      <h3><span class="method get">GET</span> /metrics</h3>
+      <p class="desc">Prometheus exposition format: raw counters, gauges and histograms rather than the rolling averages above. Requires the optional <code>metrics</code> extra (<code>pip install -e ".[metrics]"</code>) and <code>metrics_config.prometheus_enabled</code>; when disabled the route is not registered at all, so a scraper sees a clean <code>404</code> rather than an endpoint reporting itself unavailable.</p>
+      <p class="desc">This is deliberately not derived from <code>/api/metrics</code>. That endpoint averages over the last 1000 samples &mdash; a window whose <em>duration</em> varies with traffic &mdash; which is precisely what a time-series backend must not be handed pre-aggregated.</p>
+      <table>
+        <tr><th>Metric</th><th>Type</th><th>Description</th></tr>
+        <tr><td><code>ephemeris_queue_latency_seconds</code></td><td>histogram</td><td>Time between enqueue and admission.</td></tr>
+        <tr><td><code>ephemeris_token_throughput_per_second</code></td><td>histogram</td><td>Tokens per second per scheduler step.</td></tr>
+        <tr><td><code>ephemeris_batch_size</code></td><td>gauge</td><td>Requests in the most recent batch.</td></tr>
+        <tr><td><code>ephemeris_batch_occupancy_ratio</code></td><td>gauge</td><td>Active requests as a fraction of <code>max_batch_size</code>.</td></tr>
+        <tr><td><code>ephemeris_kv_cache_utilization_ratio</code></td><td>gauge</td><td>Used KV blocks as a fraction of pool capacity.</td></tr>
+        <tr><td><code>ephemeris_timeout_evictions_total</code></td><td>counter</td><td>Requests dropped at their deadline.</td></tr>
+        <tr><td><code>ephemeris_cancelled_evictions_total</code></td><td>counter</td><td>Clients that disconnected mid-generation.</td></tr>
+        <tr><td><code>ephemeris_kv_blocks_reclaimed_total</code></td><td>counter</td><td>KV blocks returned to the allocator by an idle trim.</td></tr>
+      </table>
+      <p class="desc" style="margin-top:1rem;">All are labelled <code>path="batch"</code> or <code>path="streaming"</code>, matching the two top-level keys in the JSON endpoint. Authentication follows <code>metrics_config.require_auth</code>; see <code>deploy/prometheus/README.md</code> for scrape configuration and the per-gauge multiprocess modes.</p>
+      <p style="margin-top:1rem;"><strong>Example</strong></p>
+      <pre><code>curl -H "Authorization: Bearer $EPHEMERIS_CLIENT_API_KEY" \
+  http://localhost:8000/metrics</code></pre>
     </div>
 
   </section>

@@ -127,19 +127,26 @@ Imports:
 - Reads `model_config.defaults` from `settings/config.yaml`.
 - `model_name`: `os.environ.get("EPHEMERIS_SERVER_MODEL_NAME")` if set, else the YAML default. This is how `ephemeris-serve serve --model` picks a model without editing the YAML file, and it's read via an env var (not a later in-process mutation) specifically so it survives uvicorn spawning fresh worker processes when `--workers > 1`.
 - `device`: resolved via `resolve_device(config["device"])`.
-- `max_length`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, `num_return_sequences`: passed through from YAML.
+- `max_length`, `temperature`, `top_k`, `top_p`, `repetition_penalty`, `num_return_sequences`: passed through from YAML. `temperature`, `top_k` and `top_p` are per-request *defaults* -- a caller can override each on `GenerateRequest`, and `InferenceRequest` resolves the fallback at construction. `repetition_penalty` stays global on both sampling paths.
 
 Note: `model_settings.model_name` is also updated at runtime by `ModelLoader.reload()` (see [Model and Tokenizer](Model-and-Tokenizer#model-and-tokenizer)) once a `POST /api/model` hot-swap actually succeeds -- so `model_settings.model_name` always reflects whatever model is *currently* loaded, whether that was decided at process start (YAML or env var) or by a later runtime swap.
 
 `LoggingSetting`: reads `logging_config.defaults` -- `log_level`, `log_file`.
 
-`SchedulerSetting`: reads `scheduler_config.defaults` -- `streaming_request_timeout_seconds`, `batch_request_timeout_seconds`, `batch_generation_timeout_seconds`, `idempotency_key_ttl_seconds`, `model_swap_drain_timeout_seconds` (default `30.0` if absent from YAML, via `config.get(...)`). The single source of truth for every timeout used across `api/routes.py`, `scheduler/batch_scheduler.py`, and `scheduler/model_swap.py`.
+`SchedulerSetting`: reads `scheduler_config.defaults` -- `streaming_request_timeout_seconds`, `batch_request_timeout_seconds`, `batch_generation_timeout_seconds`, `idempotency_key_ttl_seconds`, `model_swap_drain_timeout_seconds` (default `30.0` if absent from YAML, via `config.get(...)`). The single source of truth for every timeout used across `api/routes.py`, `scheduler/batch_scheduler.py`, and `scheduler/model_swap.py`. Also carries:
+- `stop_window_slack_tokens` (default `16`): extra tokens decoded beyond the longest stop sequence when checking for a match. Sized in tokens against a character length, which errs long -- every token decodes to at least one character.
+- `short_request_max_tokens` / `short_lane_reserved_slots` / `priority_aging_seconds`: request fairness. A request asking for at most `short_request_max_tokens` takes the short lane, which has slots reserved for it; aging promotes a waiting long request after `priority_aging_seconds` so the reservation cannot starve it in turn. `api/server.py` warns at startup if the aging window is not comfortably below `streaming_request_timeout_seconds`, since a request evicted before it is promoted makes the feature silently inert.
+- `model_state_dir` / `model_state_poll_seconds`: cross-worker model-swap coordination. Empty means single-process behavior.
 
-`CacheSetting`: reads `cache_config.defaults` -- `kv_block_size`, consumed by `ContinuousScheduler.paged_cache` when constructing the `PagedKVCache`.
+`RateLimitSetting`: reads `rate_limit_config.defaults` -- `enabled` (default `false`), `requests_per_second`, `burst`, `max_concurrent_requests` (`0` disables the concurrency cap). Consumed by `api/ratelimit.py`. Per worker process, so `--workers N` multiplies the effective limit by N.
+
+`MetricsSetting`: reads `metrics_config.defaults` -- `prometheus_enabled` (default `false`), `require_auth`. Consumed by `metrics/prometheus.py` and the `/metrics` route registration in `api/server.py`.
+
+`CacheSetting`: reads `cache_config.defaults` -- `kv_block_size`, consumed by `ContinuousScheduler.paged_cache` when constructing the `PagedKVCache`, plus `kv_pool_trim_idle_seconds`, `kv_pool_peak_decay` and `kv_pool_peak_slack`, which govern idle block-pool reclamation (see `ContinuousScheduler._maybe_trim_kv_pool`).
 
 `SecretSetting(BaseSettings)`: `hf_key: str | None = ""`, read from `.env` by default.
 
-Global instances: `model_settings`, `logging_settings`, `scheduler_settings`, `cache_settings`, `secret_settings`.
+Global instances: `model_settings`, `logging_settings`, `scheduler_settings`, `cache_settings`, `rate_limit_settings`, `metrics_settings`, `secret_settings`.
 
 ### `settings/config.yaml`
 
@@ -159,7 +166,16 @@ Current defaults:
 - `batch_generation_timeout_seconds: 25.0`
 - `idempotency_key_ttl_seconds: 300.0`
 - `model_swap_drain_timeout_seconds: 30.0`
+- `stop_window_slack_tokens: 16`
+- `short_request_max_tokens: 64`
+- `short_lane_reserved_slots: 2`
+- `priority_aging_seconds: 10.0`
+- `model_state_dir: ""` (cross-worker swap coordination off)
+- `model_state_poll_seconds: 2.0`
+- `rate_limit_config.enabled: false`, `requests_per_second: 5.0`, `burst: 20`, `max_concurrent_requests: 8`
+- `metrics_config.prometheus_enabled: false`, `require_auth: true`
 - `kv_block_size: 16`
+- `kv_pool_trim_idle_seconds: 60.0`, `kv_pool_peak_decay: 0.9`, `kv_pool_peak_slack: 1.5`
 
 Notes:
 - The model name is easily replaceable with any compatible causal language model -- at process start via this file or `EPHEMERIS_SERVER_MODEL_NAME`/`ephemeris-serve serve --model`, or at runtime via `POST /api/model` / the CLI's `/model` command.

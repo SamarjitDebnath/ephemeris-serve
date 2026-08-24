@@ -30,6 +30,11 @@ dependencies = [
 ephemeris-serve = "api.cli:cli"
 
 [project.optional-dependencies]
+# Prometheus export is optional: the server runs unchanged without it and the
+# JSON /api/metrics endpoint is unaffected. See metrics/prometheus.py.
+metrics = [
+    "prometheus-client>=0.20.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",

@@ -4,7 +4,7 @@ import torch
 from dataclasses import dataclass
 from typing import List, Optional
 from transformers import DynamicCache
-from settings.settings import model_settings, logging_settings, cache_settings
+from settings.settings import model_settings, logging_settings, cache_settings, scheduler_settings
 from tokenizer.tokenizer_service import tokenizer_service
 from scheduler.request_queue import request_queue
 from scheduler.request import InferenceRequest
@@ -58,6 +58,19 @@ class ContinuousScheduler:
         # Lazily constructed once the model is loaded (see `paged_cache` property) --
         # building it here would force an eager model load.
         self._paged_cache: Optional[PagedKVCache] = None
+        # Idle KV-pool reclamation state -- see `_maybe_trim_kv_pool`.
+        # `_peak_used_blocks` is a decaying high-water mark of block usage, so
+        # a server that has been busy recently keeps its headroom instead of
+        # paying the re-growth cost on the next burst. `_idle_since` is when
+        # the batch last drained, and doubles as the "last trim evaluated at"
+        # clock.
+        self._peak_used_blocks: float = 0.0
+        self._idle_since: Optional[float] = None
+        # Model-swap generation this worker has converged on. Compared against
+        # the shared target in the idle branch -- see
+        # `scheduler/model_swap.follow_model_state`.
+        self._model_generation: int = 0
+        self._last_model_state_check: float = 0.0
 
     @property
     def paged_cache(self) -> PagedKVCache:
@@ -91,6 +104,95 @@ class ContinuousScheduler:
         active request's `block_table` still points into the old cache.
         """
         self._paged_cache = None
+        # The high-water mark was measured in the old model's blocks, whose
+        # per-block byte size does not carry over to the new one.
+        self._peak_used_blocks = 0.0
+        self._idle_since = None
+
+    def _maybe_trim_kv_pool(self) -> None:
+        """Hand idle paged-KV-pool capacity back, once quiet long enough that
+        the trim will not simply be re-grown.
+
+        The pool grows by doubling and, left alone, never shrinks -- one burst
+        of heavy concurrency sets the process memory floor for the rest of the
+        server's life. `PagedKVCache.trim_tail` is safe to call at any time
+        (it only ever drops blocks that are already free), so the whole
+        question is *when* it is worth calling. Three guards:
+
+        - **Dwell.** Nothing happens until the batch has been empty for
+          `kv_pool_trim_idle_seconds`. Bursts spaced closer than that never
+          trigger a trim, so back-to-back traffic does not pay re-growth.
+        - **Decaying peak floor.** Never trim to the initial capacity; trim to
+          `max(initial, recent_peak * slack)`, with the remembered peak fading
+          by `kv_pool_peak_decay` per evaluation.
+        - **Geometric shrink.** Halve per trim rather than dropping straight
+          to the floor -- symmetric with how the pool grew, so there is no
+          cliff.
+        """
+        cache = self._paged_cache
+        if cache is None:
+            return
+        if self.active_requests:
+            self._idle_since = None
+            return
+
+        now = time.monotonic()
+        if self._idle_since is None:
+            self._idle_since = now
+            return
+
+        dwell = cache_settings.kv_pool_trim_idle_seconds
+        if dwell <= 0 or now - self._idle_since < dwell:
+            return
+        # One evaluation per dwell period, reclaim or not: this loop ticks
+        # every few milliseconds while idle, and the decay below has to run at
+        # the dwell's rate rather than the loop's or the remembered peak would
+        # vanish within a second of going quiet.
+        self._idle_since = now
+
+        self._peak_used_blocks *= cache_settings.kv_pool_peak_decay
+        floor = max(
+            cache.initial_capacity_blocks,
+            int(self._peak_used_blocks * cache_settings.kv_pool_peak_slack),
+        )
+        # Hysteresis: only bother once capacity is well clear of the floor,
+        # so a pool already near its working size is left alone.
+        if cache.capacity <= 2 * floor:
+            return
+
+        reclaimed = cache.trim_tail(max(floor, cache.capacity // 2))
+        if reclaimed:
+            streaming_metrics.record_kv_blocks_reclaimed(reclaimed)
+            logger.info(
+                "Trimmed %d idle KV cache blocks (capacity now %d, floor %d)",
+                reclaimed,
+                cache.capacity,
+                floor,
+            )
+
+    async def _maybe_follow_model_state(self) -> None:
+        """Converge on a model swap performed by another worker.
+
+        Rate-limited to one check per `model_state_poll_seconds`: this branch
+        ticks every few milliseconds while idle, and the check touches the
+        filesystem. Only the cheap `stat` behind `read_state` runs most of the
+        time; an actual reload happens once per generation bump.
+        """
+        from scheduler.model_swap import follow_model_state
+        from scheduler import model_state
+
+        if not model_state.enabled():
+            return
+        now = time.monotonic()
+        if now - self._last_model_state_check < scheduler_settings.model_state_poll_seconds:
+            return
+        self._last_model_state_check = now
+        try:
+            await follow_model_state(self)
+        except Exception:
+            # Never let a coordination problem kill the run loop -- a worker
+            # serving a stale model beats a worker serving nothing.
+            logger.exception("Model state follow check failed")
 
     def _pad_batch(self, tensors, padding_value):
         """Right-pad each tensor to the batch's max width and stack them.
@@ -111,15 +213,62 @@ class ContinuousScheduler:
                 padded.append(t)
         return torch.cat(padded, dim=0)
 
+    def _admission_limit_for(self, priority_class: int) -> int:
+        """How many active requests this class is allowed to occupy.
+
+        The short lane may use the whole batch; the general lane may not use
+        the slots reserved for short requests. That asymmetry is the point: it
+        bounds a short request's wait by one long request's *step*, rather than
+        by one long request's whole generation.
+
+            max_batch_size = 8, short_lane_reserved_slots = 2
+
+            ┌─────────────────────┬───────────┐
+            │ 6 general           │ 2 short   │
+            └─────────────────────┴───────────┘
+              general capped here    short may also use the left side
+
+        Starvation in the other direction is handled by aging in
+        `PriorityRequestQueue`, not here -- a long request that has waited long
+        enough simply arrives at the front of the queue.
+        """
+        from scheduler.request import SHORT_REQUEST_CLASS
+
+        if priority_class == SHORT_REQUEST_CLASS:
+            return self.max_batch_size
+        reserved = max(0, scheduler_settings.short_lane_reserved_slots)
+        return max(1, self.max_batch_size - reserved)
+
+    def _active_count_for(self, priority_class: int) -> int:
+        from scheduler.request import SHORT_REQUEST_CLASS
+
+        if priority_class == SHORT_REQUEST_CLASS:
+            return len(self.active_requests)
+        return sum(
+            1
+            for req in self.active_requests
+            if getattr(req, "priority_class", SHORT_REQUEST_CLASS) != SHORT_REQUEST_CLASS
+        )
+
     async def _add_new_requests(self):
         """Pull requests from the global ``request_queue`` until the batch is full
         or the timeout elapses.
         """
+        deferred = []
         while len(self.active_requests) < self.max_batch_size:
             try:
                 req: InferenceRequest = await asyncio.wait_for(
                     request_queue.get(), timeout=self.timeout
                 )
+                priority_class = getattr(req, "priority_class", 0)
+                if self._active_count_for(priority_class) >= self._admission_limit_for(priority_class):
+                    # This class is at its cap but the batch is not full, so
+                    # something in a lower class may still be admissible. Hold
+                    # this one and keep looking; everything held is put back
+                    # before returning, so nothing is lost or reordered.
+                    deferred.append(req)
+                    continue
+
                 # Tokenise the prompt once and move tensors to the engine device
                 # Apply chat template if available
                 formatted_prompt = req.prompt
@@ -153,6 +302,7 @@ class ContinuousScheduler:
 
                 req.queue_latency_ms = time.monotonic() - req.enqueue_time
                 streaming_metrics.record_queue_latency(req.queue_latency_ms)
+                streaming_metrics.record_queue_latency_by_class(req.queue_latency_ms, priority_class)
 
                 self.active_requests.append(req)
                 logger.debug(
@@ -162,6 +312,9 @@ class ContinuousScheduler:
                 )
             except asyncio.TimeoutError:
                 break
+
+        for req in deferred:
+            await request_queue.put(req)
 
     def _prepare_batch(self) -> Optional[_BatchInputs]:
         """Build one batched forward-pass input, mixing prefill and decode rows.
@@ -312,15 +465,35 @@ class ContinuousScheduler:
             req.generated_tokens.append(token_id)
 
             # Check whether the text generated so far contains one of the
-            # request's stop sequences. Checked against the full decoded
-            # text (not just this token) since a stop sequence can span
-            # multiple tokens and needn't align with token boundaries.
+            # request's stop sequences. Matched on decoded *text*, not token
+            # ids, since a stop sequence can span multiple tokens and needn't
+            # align with token boundaries.
+            #
+            # Decoding the whole history every step would be linear per step
+            # and so quadratic per request. Instead the tail acts as a cheap
+            # filter and the full decode is the confirmation:
+            #
+            #   * A stop sequence that matches at all matches within the last
+            #     `max_stop_length` characters plus whatever is new, so a
+            #     bounded tail is enough to *detect* one.
+            #   * The full text is needed only to resolve `stop_text` at the
+            #     right offset -- and only once, on the step that actually
+            #     stops, not on every step.
+            #
+            # A false positive from the tail costs one full decode and is then
+            # rejected below; since a real match ends the request, that can
+            # happen at most once. The window is sized in tokens from a
+            # character length, which errs long: every token decodes to at
+            # least one character.
             stop_text = None
             if req.stop_sequences:
-                decoded = tokenizer_service.decode(req.generated_tokens)
-                stop_idx = find_stop_index(decoded, req.stop_sequences)
-                if stop_idx is not None:
-                    stop_text = decoded[:stop_idx]
+                window = req.max_stop_length + scheduler_settings.stop_window_slack_tokens
+                tail_text = tokenizer_service.decode(req.generated_tokens[-window:])
+                if find_stop_index(tail_text, req.stop_sequences) is not None:
+                    decoded = tokenizer_service.decode(req.generated_tokens)
+                    stop_idx = find_stop_index(decoded, req.stop_sequences)
+                    if stop_idx is not None:
+                        stop_text = decoded[:stop_idx]
 
             # Append token to tensors for the next iteration
             # Ensure tensors are present and use matching dtype/device for concatenation
@@ -512,8 +685,8 @@ class ContinuousScheduler:
             self.engine.sample(
                 logits[i].unsqueeze(0),
                 req.temperature,
-                model_settings.top_k,
-                model_settings.top_p,
+                req.top_k,
+                req.top_p,
             )
             for i, req in enumerate(reqs)
         ])
@@ -621,6 +794,7 @@ class ContinuousScheduler:
         # that never hits an idle gap.
         if not self.active_requests:
             empty_device_cache(self.engine.device)
+            self._maybe_trim_kv_pool()
         else:
             maybe_empty_device_cache(self.engine.device)
 
@@ -632,10 +806,12 @@ class ContinuousScheduler:
         # paged cache at all (e.g. `_prepare_batch` is mocked out in tests),
         # and this metric isn't worth forcing it to build.
         if self._paged_cache is not None:
-            streaming_metrics.record_cache_utilization(
-                self._paged_cache.capacity - len(self._paged_cache.free_blocks),
-                self._paged_cache.capacity,
-            )
+            used_blocks = self._paged_cache.capacity - len(self._paged_cache.free_blocks)
+            streaming_metrics.record_cache_utilization(used_blocks, self._paged_cache.capacity)
+            # Peak tracking is free -- the same two numbers the metric wants.
+            # The decay side lives in `_maybe_trim_kv_pool`, which only runs
+            # while idle.
+            self._peak_used_blocks = max(float(used_blocks), self._peak_used_blocks)
 
     async def run(self):
         """Main scheduler loop.
@@ -647,6 +823,11 @@ class ContinuousScheduler:
             try:
                 await self._add_new_requests()
                 if not self.active_requests:
+                    # `_step` never runs with an empty batch, so this is the
+                    # only path that sees a server that has been idle for a
+                    # while -- the dwell timer would otherwise never elapse.
+                    self._maybe_trim_kv_pool()
+                    await self._maybe_follow_model_state()
                     await asyncio.sleep(0.01)
                     continue
                 await self._step()

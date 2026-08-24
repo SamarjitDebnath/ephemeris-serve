@@ -32,10 +32,13 @@ Key capabilities:
 - HTTP endpoint `/api/generate` for streaming, prompt-based generation
 - HTTP endpoint `/api/generate_batch` for non-streaming batch generation with request timeout and cancellation support
 - HTTP endpoint `/api/model` (`GET`/`POST`) to inspect or hot-swap the loaded model without a process restart
-- HTTP endpoint `/api/metrics` for runtime queue and batch metrics
+- HTTP endpoint `/api/metrics` for runtime queue and batch metrics, plus an optional Prometheus scrape endpoint at `/metrics`
+- Per-API-key rate limiting (token bucket plus concurrency cap) on the generation routes, off by default
 - Server-sent events (SSE) token streaming using `EventSourceResponse`
 - Automatic chat prompt formatting when tokenizer supports `apply_chat_template()`, with raw-prompt fallback for base models
-- Central request queues and a continuous scheduler for asynchronous generation, using a block-based ("paged") KV cache that supports mixing prefill and decode rows in the same batched step
+- Central request queues and a continuous scheduler for asynchronous generation, using a block-based ("paged") KV cache that supports mixing prefill and decode rows in the same batched step, whose block pool is reclaimed when the server goes idle
+- Cost-classed request scheduling: short requests get reserved batch slots so a burst of long generations cannot starve them, with aging so the reservation cannot starve long requests in turn
+- Per-request `top_k`/`top_p`/`temperature`, each falling back to the configured default
 - Per-request `stop` sequences, checked on both the streaming and batch generation paths
 - Buffered token streaming that emits only at whitespace/punctuation boundaries or after a short buffer threshold
 - Pytorch model execution with configurable temperature, top-k, top-p, and repetition penalty

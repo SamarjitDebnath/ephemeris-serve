@@ -21,6 +21,8 @@ class GenerationRequest(Protocol):
     future: asyncio.Future
     queue: "asyncio.Queue | None"
     temperature: float
+    top_k: int
+    top_p: float
     max_tokens: int
     generated_tokens: list[int]
     finished: bool
@@ -339,8 +341,8 @@ class InferenceEngine:
                     token = self.sample(
                         logits[i].unsqueeze(0),
                         r.temperature,
-                        model_settings.top_k,
-                        model_settings.top_p
+                        r.top_k,
+                        r.top_p
                     )
                     next_tokens[i] = token
 
