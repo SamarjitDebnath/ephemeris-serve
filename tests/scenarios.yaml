@@ -1,0 +1,317 @@
+# Declarative test scenarios.
+#
+# Add a case here instead of writing Python -- `tests/conftest.py` expands
+# every entry below into its own pytest case, named after `name:`. See
+# TESTING.md for the full schema.
+#
+# JSON works too: `yaml.safe_load` parses it, so point
+# EPHEMERIS_TEST_SCENARIOS at a `.json` file and nothing else changes.
+#
+# Two shapes of entry, told apart by which block they carry:
+#   * `expect:`     -- behavioral. Deterministic, so it always asserts.
+#   * `thresholds:` -- latency. Always recorded; asserts only with
+#                      `enforce: true` (plus `enforce_on_ci: true` on CI).
+# An entry with neither is measure-only: it lands in the report and can
+# never fail.
+
+defaults:
+  model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  base_url: http://127.0.0.1:8000
+  max_tokens: 64
+  temperature: 0.7
+  timeout_seconds: 30
+  iterations: 50
+  concurrency: 1
+
+scenarios:
+  # ------------------------------------------------------------------ #
+  # Single-prompt latency, by input size.
+  # ------------------------------------------------------------------ #
+
+  # Seeded from the old `test_prompt` fixture.
+  - name: short_prompt_latency
+    prompt: "What is machine learning?"
+    max_tokens: 32
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 20
+      p95_ms: 50
+
+  - name: tiny_prompt_latency
+    prompt: "Hi"
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 20
+      p95_ms: 50
+
+  - name: medium_prompt_latency
+    prompt: >-
+      Explain the difference between supervised, unsupervised, and
+      reinforcement learning, and give one concrete example of each.
+    max_tokens: 128
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 30
+      p95_ms: 75
+
+  - name: long_prompt_latency
+    # Deliberately past the point where tokenization stops being free --
+    # this is the input size that would hit the tokenizer's `max_length`
+    # truncation on a small context window.
+    prompt: >-
+      A transformer processes a sequence by attending over every position at
+      once rather than stepping through it. Each layer projects the input into
+      queries, keys, and values, scores every query against every key, and
+      mixes the values by those scores. Stacking such layers lets information
+      travel between any two positions in a single hop, which is what makes
+      the architecture parallelizable across a sequence during training. The
+      cost is quadratic in sequence length, which is why long-context work
+      leans on sparsity, low-rank approximations, or paging schemes that keep
+      only part of the attention state resident at any one time. Summarize the
+      tradeoffs above and say which one matters most for inference serving.
+    max_tokens: 256
+    iterations: 25
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 100
+      p95_ms: 200
+
+  - name: unicode_prompt_latency
+    # Multi-byte input takes a different path through the BPE merge table
+    # than plain ASCII; worth measuring rather than assuming.
+    prompt: "机器学习是什么？ Qu'est-ce que l'apprentissage automatique ? 🤖"
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 30
+      p95_ms: 75
+
+  - name: code_prompt_latency
+    # Literal block (`|-`), not folded (`>-`): indentation is the content
+    # here, and a folded scalar only preserves it by accident.
+    prompt: |-
+      def attention(q, k, v):
+          scores = (q @ k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+          return scores.softmax(dim=-1) @ v
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 30
+      p95_ms: 75
+
+  - name: whitespace_heavy_prompt_latency
+    prompt: "   What    is     machine        learning ?   "
+    tags: [latency]
+    enforce: true
+    thresholds:
+      mean_ms: 20
+
+  # ------------------------------------------------------------------ #
+  # Batch and concurrency. Seeded from the old `test_prompts` fixture.
+  # ------------------------------------------------------------------ #
+
+  - name: batch_throughput
+    prompts:
+      - "What is machine learning?"
+      - "Explain deep learning in simple terms"
+      - "How does a neural network work?"
+      - "What is a transformer model?"
+      - "Describe gradient descent"
+    iterations: 10
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 50
+
+  - name: batch_throughput_mixed_lengths
+    # A batch whose rows differ sharply in length is the case that exercises
+    # padding, so it should not be measured only on uniform inputs.
+    prompts:
+      - "Hi"
+      - "What is machine learning?"
+      - >-
+        Walk through how a paged KV cache allocates blocks, why the pool grows
+        by doubling, and what has to be true before any of that capacity can
+        be handed back.
+    iterations: 10
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 60
+
+  - name: concurrent_batch_latency
+    prompts:
+      - "What is machine learning?"
+      - "Explain deep learning in simple terms"
+      - "How does a neural network work?"
+      - "What is a transformer model?"
+      - "Describe gradient descent"
+    iterations: 10
+    concurrency: 5
+    tags: [latency, benchmark, slow]
+    # No `thresholds:` -- measure-only. Recorded in the report, never asserted.
+
+  - name: concurrent_low_fanout
+    prompts:
+      - "What is machine learning?"
+      - "Explain deep learning in simple terms"
+      - "How does a neural network work?"
+    iterations: 10
+    concurrency: 3
+    tags: [latency, benchmark, slow]
+    # Measure-only: thread fan-out timings are the least stable thing here.
+
+  - name: concurrent_high_fanout
+    prompts:
+      - "What is machine learning?"
+      - "Explain deep learning in simple terms"
+      - "How does a neural network work?"
+      - "What is a transformer model?"
+      - "Describe gradient descent"
+      - "What is attention in a transformer?"
+      - "Why does a KV cache speed up decoding?"
+      - "What is continuous batching?"
+    iterations: 5
+    concurrency: 8
+    tags: [latency, benchmark, slow]
+
+  - name: serialized_baseline_for_fanout
+    # The `concurrency: 1` control for the two above. Comparing this row's
+    # p50 against theirs in the report is the only way to read them.
+    prompts:
+      - "What is machine learning?"
+      - "Explain deep learning in simple terms"
+      - "How does a neural network work?"
+    iterations: 10
+    concurrency: 1
+    tags: [latency, benchmark]
+    enforce: true
+    thresholds:
+      mean_ms: 50
+
+  # ------------------------------------------------------------------ #
+  # Behavior: stop-sequence truncation (`utils.stop_sequences`).
+  # These assert on every run, CI included -- nothing here is timing.
+  # ------------------------------------------------------------------ #
+
+  - name: stop_sequence_honored
+    prompt: "Count: 1 2 3 4 5"
+    stop: ["4"]
+    tags: [behavior]
+    expect:
+      not_contains: "5"
+
+  - name: stop_sequence_drops_the_marker_itself
+    # The stop text must not survive in the output either, not just what
+    # follows it.
+    prompt: "Count: 1 2 3 4 5"
+    stop: ["4"]
+    tags: [behavior]
+    expect:
+      not_contains: "4"
+
+  - name: stop_sequence_keeps_text_before_it
+    prompt: "Count: 1 2 3 4 5"
+    stop: ["4"]
+    tags: [behavior]
+    expect:
+      contains: "1 2 3"
+
+  - name: stop_sequence_absent_keeps_text
+    prompt: "Count: 1 2 3 4 5"
+    stop: ["nine"]
+    tags: [behavior]
+    expect:
+      contains: "5"
+
+  - name: no_stop_sequences_keeps_everything
+    prompt: "Count: 1 2 3 4 5"
+    tags: [behavior]
+    expect:
+      contains: "5"
+
+  - name: earliest_stop_sequence_wins
+    # Both appear; truncation happens at the earlier one regardless of the
+    # order they are listed in.
+    prompt: "alpha beta gamma"
+    stop: ["gamma", "beta"]
+    tags: [behavior]
+    expect:
+      not_contains: "gamma"
+
+  - name: earliest_stop_sequence_wins_keeps_prefix
+    prompt: "alpha beta gamma"
+    stop: ["gamma", "beta"]
+    tags: [behavior]
+    expect:
+      contains: "alpha"
+
+  - name: empty_stop_sequence_is_ignored
+    # An empty string would match at index 0 and truncate everything; it has
+    # to be skipped, not treated as an immediate stop.
+    prompt: "alpha beta gamma"
+    stop: ["", "gamma"]
+    tags: [behavior]
+    expect:
+      contains: "alpha beta"
+
+  - name: stop_sequence_at_the_very_start
+    prompt: "STOPeverything after this"
+    stop: ["STOP"]
+    tags: [behavior]
+    expect:
+      not_contains: "everything"
+
+  - name: stop_sequence_is_case_sensitive
+    # `str.find` does not fold case, and neither should the server -- a stop
+    # sequence that silently matched other casings would truncate output the
+    # caller expected to keep.
+    prompt: "the END here"
+    stop: ["end"]
+    tags: [behavior]
+    expect:
+      contains: "END"
+
+  - name: multi_token_stop_sequence
+    # The realistic chat-template case: halt before the next speaker turn.
+    prompt: "Answer: yes\nUser: and then?"
+    stop: ["\nUser:"]
+    tags: [behavior]
+    expect:
+      contains: "Answer: yes"
+
+  - name: multi_token_stop_sequence_drops_the_turn
+    prompt: "Answer: yes\nUser: and then?"
+    stop: ["\nUser:"]
+    tags: [behavior]
+    expect:
+      not_contains: "and then"
+
+  - name: stop_sequence_matches_first_occurrence_only
+    # Repeated marker: truncation is at the first hit, so the second copy is
+    # gone too.
+    prompt: "one END two END three"
+    stop: ["END"]
+    tags: [behavior]
+    expect:
+      contains: "one "
+
+  - name: stop_sequence_inside_a_word_still_matches
+    # Stop sequences are plain substrings, not word-boundary matches. Worth
+    # pinning: it is the surprising half of the contract.
+    prompt: "unstoppable force"
+    stop: ["stop"]
+    tags: [behavior]
+    expect:
+      not_contains: "force"
+
+  - name: unicode_stop_sequence
+    prompt: "答案是：42。请继续"
+    stop: ["。"]
+    tags: [behavior]
+    expect:
+      contains: "42"

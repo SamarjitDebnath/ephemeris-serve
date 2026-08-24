@@ -1,11 +1,11 @@
-.PHONY: help install dev sync run test test-latency test-unit test-all format lint clean logs build-ephemeris wiki-sync smoke-nginx
+.PHONY: help install dev sync run test test-latency test-unit test-all test-report format lint clean logs build-ephemeris wiki-sync smoke-nginx
 
 help:
 	@echo "LLM Inference Server - Available Commands"
 	@echo ""
 	@echo "Setup & Installation:"
 	@echo "  make install      - Install dependencies (production only)"
-	@echo "  make dev          - Install with dev dependencies"
+	@echo "  make dev          - Install with dev dependencies + the chat client"
 	@echo "  make sync         - Sync dependencies from uv.lock"
 	@echo ""
 	@echo "Running:"
@@ -17,6 +17,7 @@ help:
 	@echo "  make test-unit    - Run unit tests"
 	@echo "  make test-latency - Run latency benchmarks"
 	@echo "  make test-all     - Run all tests"
+	@echo "  make test-report  - Run the suite and write reports/test_report.md"
 	@echo "  make smoke-nginx  - Verify the nginx reverse-proxy config (needs nginx)"
 	@echo ""
 	@echo "Code Quality:"
@@ -34,6 +35,7 @@ install:
 
 dev: install
 	uv pip install -e ".[dev]"
+	uv pip install -e packages/ephemeris-cli
 
 sync:
 	uv sync
@@ -59,6 +61,12 @@ test-latency:
 
 test-all: test-unit test-latency
 	@echo "✓ All tests completed"
+
+# Scenario cases come from tests/scenarios.yaml; point
+# EPHEMERIS_TEST_SCENARIOS at another file to run a different set.
+test-report:
+	uv run pytest tests/ --report-md=reports/test_report.md
+	@echo "✓ Report written to reports/test_report.md"
 
 format:
 	uv run black . --exclude="venv|.venv"

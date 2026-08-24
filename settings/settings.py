@@ -66,6 +66,30 @@ class SchedulerSetting:
         self.batch_generation_timeout_seconds = config["batch_generation_timeout_seconds"]
         self.idempotency_key_ttl_seconds = config["idempotency_key_ttl_seconds"]
         self.model_swap_drain_timeout_seconds = config.get("model_swap_drain_timeout_seconds", 30.0)
+        self.stop_window_slack_tokens = config.get("stop_window_slack_tokens", 16)
+        self.short_request_max_tokens = config.get("short_request_max_tokens", 64)
+        self.short_lane_reserved_slots = config.get("short_lane_reserved_slots", 2)
+        self.priority_aging_seconds = config.get("priority_aging_seconds", 10.0)
+        self.model_state_dir = config.get("model_state_dir", "") or ""
+        self.model_state_poll_seconds = config.get("model_state_poll_seconds", 2.0)
+
+
+class MetricsSetting:
+    def __init__(self, config_path: str = "settings/config.yaml"):
+        config = Utils.load_config(config_path).get("metrics_config", {}).get("defaults", {})
+
+        self.prometheus_enabled = config.get("prometheus_enabled", False)
+        self.require_auth = config.get("require_auth", True)
+
+
+class RateLimitSetting:
+    def __init__(self, config_path: str = "settings/config.yaml"):
+        config = Utils.load_config(config_path).get("rate_limit_config", {}).get("defaults", {})
+
+        self.enabled = config.get("enabled", False)
+        self.requests_per_second = config.get("requests_per_second", 5.0)
+        self.burst = config.get("burst", 20)
+        self.max_concurrent_requests = config.get("max_concurrent_requests", 8)
 
 
 class CacheSetting:
@@ -73,6 +97,11 @@ class CacheSetting:
         config = Utils.load_config(config_path)["cache_config"]["defaults"]
 
         self.kv_block_size = config["kv_block_size"]
+        # See `ContinuousScheduler._maybe_trim_kv_pool`. `.get` with a default
+        # so an older config.yaml still loads.
+        self.kv_pool_trim_idle_seconds = config.get("kv_pool_trim_idle_seconds", 60.0)
+        self.kv_pool_peak_decay = config.get("kv_pool_peak_decay", 0.9)
+        self.kv_pool_peak_slack = config.get("kv_pool_peak_slack", 1.5)
 
 
 class SecretSetting(BaseSettings):
@@ -114,4 +143,6 @@ model_settings = ModelSetting()
 logging_settings = LoggingSetting()
 scheduler_settings = SchedulerSetting()
 cache_settings = CacheSetting()
+rate_limit_settings = RateLimitSetting()
+metrics_settings = MetricsSetting()
 secret_settings = SecretSetting()

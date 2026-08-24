@@ -77,7 +77,7 @@ Imports:
 - `idempotency_store` from `scheduler.idempotency`
 - `stream_response` from `streaming.stream_manager`
 - `request_queue`, `batch_request_queue` from `scheduler.request_queue`
-- `swap_lock`, `swap_model` from `scheduler.model_swap`
+- `swap_lock`, `swap_model_coordinated` from `scheduler.model_swap`; `model_state` from `scheduler`
 - `logging_settings`, `model_settings`, `scheduler_settings` from `settings.settings`
 - `INTERNAL_ERROR_MESSAGE` from `utils.errors` (see [Utility Helpers](Reference#utility-helpers))
 - `metrics`, `streaming_metrics`, `summarize_batch_response_metrics` from `metrics.metrics` (see [Metrics](Streaming-and-Metrics#metrics))
@@ -113,7 +113,8 @@ Imports:
 `POST /model`:
 - Returns `409` if a swap is already in progress (`swap_lock.locked()`).
 - Returns `503` if `request.app.state.scheduler` isn't set yet (server still starting up).
-- Calls `scheduler.model_swap.swap_model(swap_req.model_name, scheduler, drain_timeout)`, where `drain_timeout` is `swap_req.drain_timeout_seconds` or `scheduler_settings.model_swap_drain_timeout_seconds`.
+- Calls `scheduler.model_swap.swap_model_coordinated(swap_req.model_name, scheduler, drain_timeout)`, where `drain_timeout` is `swap_req.drain_timeout_seconds` or `scheduler_settings.model_swap_drain_timeout_seconds`. That swaps the handling worker first, then publishes the new target for the rest of the pool -- in that order, so a model this worker could not load is never advertised to the others.
+- **A multi-worker swap is not atomic, and the response says so.** Each worker drains its own in-flight requests before reloading, and those drains finish at different times, so there is necessarily a window where different workers serve different models. `ModelSwapResponse` therefore carries `generation`, `converged_workers`, and `known_workers`; a client polls `GET /api/model` until the two counts match. All three are null when `scheduler_config.model_state_dir` is unset, which is the single-process case where they would be meaningless.
 - Maps `TimeoutError` (drain took too long) to `504` with `detail=str(exc)` -- this message is deliberately authored (not raw exception text), so it's safe to return as-is. Any other exception (bad repo id, OOM, ...) is logged in full via `logger.exception` and mapped to `500` with `detail=INTERNAL_ERROR_MESSAGE`, never the raw exception text.
 - Returns `ModelSwapResponse(model_name=new_name)` on success.
 

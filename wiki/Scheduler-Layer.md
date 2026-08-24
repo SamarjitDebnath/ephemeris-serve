@@ -179,7 +179,7 @@ Evicts any request whose `deadline` has passed: calls `streaming_metrics.record_
 
 #### `_forward_and_sample(batch_inputs, reqs)`
 
-Runs `engine.forward_step(input_ids, attention_mask, past_key_values, position_ids=..., logit_gather_indices=...)`, `engine.apply_repetition_penalty()`, and per-request `engine.sample()` (using each request's own `temperature`, and the global `model_settings.top_k`/`top_p`), returning `(next_tokens, new_past)`. `reqs` must be index-aligned with `batch_inputs`'s rows -- normally `self.active_requests`, but a single-request subset during an isolation retry. Extracted so `_step()` can retry the same call once on failure without duplicating it, and so `_retry_requests_individually()` can reuse it for a batch of one.
+Runs `engine.forward_step(input_ids, attention_mask, past_key_values, position_ids=..., logit_gather_indices=...)`, `engine.apply_repetition_penalty()`, and per-request `engine.sample()` (using each request's own `temperature`, `top_k`, and `top_p`), returning `(next_tokens, new_past)`. `reqs` must be index-aligned with `batch_inputs`'s rows -- normally `self.active_requests`, but a single-request subset during an isolation retry. Extracted so `_step()` can retry the same call once on failure without duplicating it, and so `_retry_requests_individually()` can reuse it for a batch of one.
 
 #### `_step()`
 
@@ -212,6 +212,8 @@ Imports:
 - `setup_logger` from `logger`
 
 Module-level `swap_lock = asyncio.Lock()`: held for the duration of a swap. Route handlers that accept new requests check `swap_lock.locked()` (a fast, non-blocking read -- not full acquisition, since a swap can take a while) and reject with `503` rather than letting requests pile up against a model that's about to disappear.
+
+`swap_model_coordinated(new_model_name, continuous_scheduler, drain_timeout) -> (str, int | None)`: swaps this worker via `swap_model` below, then publishes the result as a new generation in `scheduler/model_state.py` so other workers converge on it. `follow_model_state(continuous_scheduler)` is the other half, called from the scheduler's idle branch -- the one place that already knows the worker has nothing in flight, which is exactly the precondition a swap needs.
 
 `swap_model(new_model_name, continuous_scheduler, drain_timeout) -> str`:
 1. Acquires `swap_lock`.

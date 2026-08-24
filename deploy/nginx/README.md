@@ -110,3 +110,22 @@ The bottom of `ephemeris-serve.conf` carries a commented HTTP→HTTPS redirect p
 - `limit_req_zone` is keyed on `$binary_remote_addr` at 10r/s with `burst=20`. Tune it to your traffic; it is a blunt guard, not a quota system. Note the cutoff is not clean: `limit_req` is a leaky bucket that refills at the configured rate while the burst drains, so a client over the limit sees *intermittent* successes among the `503`s rather than a hard stop. A measured run of 40 rapid requests returned 22 allowed / 18 limited, with one success appearing well after the first rejections.
 - `upstream ... keepalive 32` sizes reusable upstream connections. Each open SSE stream holds one, so raise it if you expect more concurrent streams than that.
 - `POST /api/model` only swaps the model in the process that handles the request. With `--workers > 1` behind this proxy, nginx will route the request to one worker and the others keep serving the old model.
+
+## Rate limiting: two layers
+
+`limit_req_zone $binary_remote_addr` in `ephemeris-serve.conf` limits by
+**client address**, at the edge, before a request reaches Python. It is the
+right place to absorb connection floods.
+
+`rate_limit_config` in `settings/config.yaml` limits by **API key** (falling
+back to client address when auth is disabled), inside the app. It is the right
+place for multi-tenant quota, because the tenant is the key, not the address --
+two tenants behind one NAT share an address, one tenant across ten machines
+does not. It also charges `/api/generate_batch` its true cost: a batch of 32
+sub-requests spends 32 tokens, where nginx sees one request.
+
+Keep both. Neither replaces the other, and the app-side limit is the only one
+that exists when the server runs without this nginx in front of it.
+
+Note the app-side limit is **per worker process**. `make run-prod` runs
+`--workers 4`, so the effective limit is four times the configured numbers.

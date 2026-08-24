@@ -10,6 +10,8 @@ Pydantic request/response models, driving both FastAPI validation and generated 
 - `prompt: str`, required, `min_length=1`.
 - `max_tokens: int | None`, `[1, 2048]`.
 - `temperature: float | None`, `[0.0, 2.0]`.
+- `top_k: int | None`, `>= 0` -- `0` disables top-k filtering. Falls back to `model_config.top_k`.
+- `top_p: float | None`, `> 0.0` and `<= 1.0` -- `1.0` disables nucleus filtering. `0.0` is excluded deliberately: it would filter every token and surface as an empty distribution mid-generation rather than a 422 at the edge.
 - `idempotency_key: str | None`, `max_length=200` -- see `scheduler/idempotency.py`.
 - `stop: list[str] | None`, `max_length=4` (at most 4 entries) -- a `field_validator` rejects any empty string in the list. Generation halts before emitting a matching sequence; see `ContinuousScheduler._dispatch_tokens`, `InferenceEngine.generate_batch`, and `streaming/stream_manager.stream_response`.
 
@@ -21,7 +23,7 @@ Pydantic request/response models, driving both FastAPI validation and generated 
 
 `ModelSwapRequest`: `model_name: str` (required), `drain_timeout_seconds: float | None` (`> 0`; defaults to `scheduler_config.model_swap_drain_timeout_seconds` if omitted).
 
-`ModelSwapResponse`: `model_name: str` -- the model currently loaded and serving requests.
+`ModelSwapResponse`: `model_name: str` (the model the answering worker has loaded), plus `generation: int | None`, `converged_workers: int | None`, `known_workers: int | None`. A multi-worker swap cannot be atomic -- each worker drains its own in-flight requests first -- so the response reports convergence instead of hiding it, and a client polls `GET /api/model` until the two counts match. All three are `None` when `scheduler_config.model_state_dir` is unset, the single-process case where they would be meaningless.
 
 ---
 
@@ -129,20 +131,23 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 - `packages/ephemeris-cli/ephemeris_cli/logo.py`: precomputed block-art rendering of the project logo, used by the CLI's startup splash.
 - `api/server.py`: FastAPI app creation, lifespan (model/tokenizer/scheduler startup, `app.state.scheduler`), shutdown.
 - `api/auth.py`: API-key authentication dependencies (`require_api_key`, `require_admin_api_key`) and the two key tiers.
-- `api/routes.py`: `/generate`, `/generate_batch`, `/model` (GET/POST), `/metrics` route handlers.
+- `api/routes.py`: `/generate`, `/generate_batch`, `/model` (GET/POST), `/metrics` route handlers, plus the Prometheus scrape handler mounted at `/metrics` on the app.
+- `api/ratelimit.py`: per-identity token bucket and concurrency cap for the generation routes.
 - `engine/model_loader.py`: model loading, device placement, warmup, and runtime `reload()`.
 - `engine/generator.py`: token sampling, forward pass, repetition penalty, batched generation, `invalidate_model_cache()`.
 - `tokenizer/tokenizer_service.py`: tokenizer loading, encoding, decoding, and runtime `reload()`.
-- `scheduler/request_queue.py`: `RequestQueue` wrapper around `asyncio.Queue`, with `empty()`.
+- `scheduler/request_queue.py`: `PriorityRequestQueue` (cost classes, reserved short-lane slots, aging) for the continuous scheduler, and the plain FIFO `RequestQueue` still used for `batch_request_queue`.
 - `scheduler/idempotency.py`: `IdempotencyStore` for `/generate`'s `idempotency_key`.
 - `scheduler/request.py`: `InferenceRequest` -- per-call state, including `stop_sequences` and `block_table`.
 - `scheduler/continuous_scheduler.py`: paged-KV-cache dynamic batching scheduler, with mixed prefill/decode and stop-sequence handling.
-- `scheduler/model_swap.py`: runtime model hot-swap coordinator (drain, reload, invalidate caches).
+- `scheduler/model_swap.py`: runtime model hot-swap coordinator (drain, reload, invalidate caches), plus `swap_model_coordinated()` and the `follow_model_state()` follower path.
+- `scheduler/model_state.py`: cross-worker swap state -- a `flock`-guarded JSON file with a monotone generation counter and per-worker convergence files. The only platform-specific code in the feature.
 - `scheduler/batch_scheduler.py`: non-streaming batch endpoint's background processing loop.
 - `cache/paged_kv_cache.py`: `PagedKVCache`/`BlockTable` -- block-based KV cache storage shared across active requests.
 - `streaming/stream_manager.py`: SSE token decoding, buffering, and stop-sequence enforcement.
 - `metrics/metrics.py`: `BatchMetrics` rolling tracker, `metrics`/`streaming_metrics` singletons, `summarize_batch_response_metrics()`.
-- `settings/settings.py`: YAML/env config loader (`model_settings`, `logging_settings`, `scheduler_settings`, `cache_settings`, `secret_settings`), `resolve_device()`.
+- `metrics/prometheus.py`: optional Prometheus counters/gauges/histograms, emitted alongside the deques rather than derived from them.
+- `settings/settings.py`: YAML/env config loader (`model_settings`, `logging_settings`, `scheduler_settings`, `cache_settings`, `rate_limit_settings`, `metrics_settings`, `secret_settings`), `resolve_device()`.
 - `settings/config.yaml`: default configuration values.
 - `schemas/schemas.py`: request/response validation models.
 - `logger/logger.py`: logger setup and handlers.
@@ -150,7 +155,8 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 - `utils/stop_sequences.py`: shared `find_stop_index()` used by the streaming, scheduler, and engine paths.
 - `utils/errors.py`: `INTERNAL_ERROR_MESSAGE` -- the generic client-facing message for unexpected failures.
 - `utils/device_cache.py`: `empty_device_cache()`/`device_memory_pressure()`/`maybe_empty_device_cache()` -- reactive and proactive CUDA/MPS cache clearing.
-- `deploy/nginx/ephemeris-serve.conf`: reverse-proxy config (SSE-safe `/api/generate` location, TLS template).
+- `deploy/nginx/ephemeris-serve.conf`: reverse-proxy config (SSE-safe `/api/generate` location, TLS template, per-address rate limit -- the outer layer complementing `api/ratelimit.py`'s per-key one).
+- `deploy/prometheus/README.md`: scrape configuration, per-gauge multiprocess modes, and how to read each metric.
 - `deploy/systemd/ephemeris-serve.service`: systemd unit (loopback bind, relative-path working directory, model-load start timeout).
 
 ---
@@ -158,7 +164,9 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 ## Appendix: Key Data Structures
 
 ### `InferenceRequest`
-- `prompt`, `max_tokens`, `temperature`: request parameters (the latter two fall back to `model_settings` if not given).
+- `prompt`, `max_tokens`, `temperature`, `top_k`, `top_p`: request parameters (all but `prompt` fall back to `model_settings` if not given, resolved at construction via `is not None` so an explicit `top_k: 0` means "filtering off" rather than "unset").
+- `priority_class`: `0` (short lane) or `1` (general), derived from `max_tokens` against `scheduler_config.short_request_max_tokens`. Consumed by `PriorityRequestQueue` and the scheduler's reserved-slot admission.
+- `max_stop_length`: longest stop sequence in characters, cached once so the scheduler and stream manager can size their bounded search windows without recomputing per token.
 - `stop_sequences`: list of strings; generation halts before emitting a match.
 - `future`: completion future.
 - `queue`: SSE token queue (`int | str | tuple` -- token ids, `"[DONE]"`, or `("[ERROR]", message)`).
@@ -170,11 +178,12 @@ The SSE pipeline yields decoded text fragments, not token IDs, buffered to natur
 
 ### `GenerationRequest` (Protocol)
 - Structural interface (`typing.Protocol`, defined in `engine/generator.py`) that `InferenceEngine.generate_batch()` depends on instead of a scheduler-owned wrapper type.
-- Fields: `future`, `queue`, `temperature`, `max_tokens`, `generated_tokens`, `finished`, `stop_sequences`.
+- Fields: `future`, `queue`, `temperature`, `top_k`, `top_p`, `max_tokens`, `generated_tokens`, `finished`, `stop_sequences`.
 - `InferenceRequest` satisfies this protocol structurally; no wrapper object is created. `generate_batch()` tracks `(original_index, request)` tuples internally to preserve output ordering.
 
 ### `PagedKVCache` / `BlockTable` (`cache/paged_kv_cache.py`)
-- `PagedKVCache`: pre-allocated, fixed-size-block key/value tensor pools (`key_pool`/`value_pool`, one entry per layer), grown by doubling when exhausted. `allocate()`/`append()`/`gather_dense()`/`free()`/`is_valid()` are the operations the scheduler uses each step.
+- `PagedKVCache`: pre-allocated, fixed-size-block key/value tensor pools (`key_pool`/`value_pool`, one entry per layer), grown by doubling when exhausted and shrunk by `trim_tail()` when idle. `allocate()`/`append()`/`gather_dense()`/`free()`/`is_valid()` are the operations the scheduler uses each step.
+- `free_blocks` is a `heapq` min-heap, so `allocate()` always takes the lowest free index and live blocks cluster at the bottom of the pool. That is what makes `trim_tail(min_capacity)` safe to run *while requests are generating*: every block above the cut is provably on the free list, so no `BlockTable` can reference it and no live index is ever remapped. The pool tensors are `.clone()`d rather than sliced, since a slice is a view that would keep the original storage alive and reclaim nothing.
 - `BlockTable`: a request's own `block_ids: list[int]` (which blocks in the pool belong to it) and `length: int` (real, unpadded token count stored so far). Freed and reset to empty by `PagedKVCache.free()`.
 - Pure PyTorch indexing, no fused kernel -- works identically on MPS/CPU/CUDA. `gather_dense()` still materializes a dense `(batch, heads, seq, head_dim)` tensor every step for the model's forward pass.
 

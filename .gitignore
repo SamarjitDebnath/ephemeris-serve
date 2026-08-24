@@ -92,6 +92,9 @@ temp/
 *.swp
 *.swo
 
+# Test reports (regenerate with `make test-report`)
+reports/
+
 # Development artifacts and internal files
 internal/
 unused_code/

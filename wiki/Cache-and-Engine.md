@@ -98,7 +98,7 @@ The engine entry point used by `BatchScheduler`. Tracks active requests as `(ori
 1. Filters out requests whose `future.cancelled()` is `True`.
 2. Forward pass: full batch if `past_key_values is None`, else `next_tokens` with the cached `past_key_values`.
 3. Vectorized repetition penalty across the batch.
-4. Samples a token per active request, using that request's own `temperature` and the global `model_settings.top_k`/`top_p`.
+4. Samples a token per active request, using that request's own `temperature`, `top_k`, and `top_p` (each falling back to the `model_config` default when the caller omits it).
 5. Per request: appends the token to `r.generated_tokens`, streams it to `r.queue` if present, then checks `r.stop_sequences` the same way the streaming path does -- decodes the full `generated_tokens`, calls `find_stop_index()`, and if matched, sets `stop_text` to the pre-match text. A request finishes (removed from the active batch, `outputs[original_idx]` set) when `stop_text is not None`, or EOS is reached, or `max_tokens` is hit; the output is `stop_text` if a stop matched, else the full decode.
 6. Appends new tokens to `input_ids`/`attention_mask`; compacts the active batch (and `past_key_values` via `batch_select_indices`) whenever any request finished this step.
 

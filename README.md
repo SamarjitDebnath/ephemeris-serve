@@ -84,6 +84,8 @@ pip install -e .                        # server
 pip install -e packages/ephemeris-cli   # chat client (no torch)
 ```
 
+`make dev` installs both, so a fresh clone gets the `ephemeris` command on `PATH` without a separate step. The two lines above are the manual equivalent, for a machine that only wants one of them -- a client-only host never needs the server's stack.
+
 They share no code, no config files, and no environment variables. Each side owns its own prefix — `EPHEMERIS_SERVER_*` for the server, `EPHEMERIS_CLIENT_*` for the client — and its own `.env`: the server's at the repo root, the client's at `packages/ephemeris-cli/.env`. The client only ever reads `EPHEMERIS_CLIENT_*` entries, so even a single shared `.env` cannot leak one side's configuration into the other. A test enforces the boundary by importing the client in a clean interpreter and asserting no server module is reachable.
 
 CLI chat client
@@ -149,6 +151,14 @@ The `/api` routes accept an API key as `Authorization: Bearer <key>`, in two tie
 | Admin | `EPHEMERIS_SERVER_ADMIN_API_KEYS` | additionally `POST /api/model` |
 
 Both are comma-separated lists, so keys rotate by adding the new one before removing the old. `POST /api/model` is gated separately because it makes the server download and load an arbitrary Hugging Face repo. `/health` and `/` stay open.
+
+Rate limiting
+-------------
+`rate_limit_config` in `settings/config.yaml` throttles `/api/generate` and `/api/generate_batch` per API key (per client address when auth is disabled), with a token bucket for request rate and a separate cap on concurrent generations. A batch is charged its sub-request count, not 1. It is **off by default**, like auth, so local development needs no setup -- turn it on for anything reachable beyond localhost. Note the buckets are per worker process, so `make run-prod`'s `--workers 4` makes the effective limit four times the configured one. The `limit_req` in `deploy/nginx/` is a complementary outer layer, not a substitute: it keys on address and cannot see batch size.
+
+Multi-worker model swaps
+------------------------
+`POST /api/model` reloads only the worker that handles it. Set `scheduler_config.model_state_dir` to a writable path shared by every worker and a swap propagates: the handling worker swaps, publishes a new generation, and each other worker converges on its next idle tick. The swap is deliberately **not** atomic across workers -- each drains its own in-flight requests first -- so the response reports `generation`, `converged_workers`, and `known_workers`, and a client polls `GET /api/model` until the counts match. Leave the setting empty for single-process behavior.
 
 **With both variables empty, authentication is disabled and every route is open** — that is the local-development default and keeps `make run` and the test suite working with no setup. The server logs a warning at startup when it is in that state. Any deployment reachable from outside localhost must set at least `EPHEMERIS_SERVER_API_KEYS`; see [`deploy/README.md`](deploy/README.md).
 
