@@ -221,10 +221,12 @@
         <p>A token bucket and a concurrency cap, keyed by API key rather than address. A batch is charged its sub-request count, so batching can&rsquo;t be used to slip past the limit.</p>
       </div>
       <div class="feature">
+        <span class="n">09</span>
         <h3>API-key auth</h3>
         <p>Two tiers of bearer key: an ordinary tier for generation and read-only routes, and a separate admin tier for the one route that loads an arbitrary model. Constant-time comparison, keys never logged.</p>
       </div>
       <div class="feature">
+        <span class="n">10</span>
         <h3>Production deployment</h3>
         <p>An nginx reverse proxy config (TLS, rate limits, SSE-safe buffering) and a systemd unit ship in <code>deploy/</code>, with a walkthrough covering keys, supervision, and pointing clients at the result.</p>
       </div>
