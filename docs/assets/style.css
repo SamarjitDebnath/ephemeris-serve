@@ -616,7 +616,12 @@ section h2 {
 
 .features {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* Six tracks with cards spanning two, rather than three tracks spanning one.
+     The dividers are the container's background showing through the 1px gaps,
+     which means an empty grid cell renders as a bare lighter block -- and the
+     card count is not always a multiple of three. Spanning lets a short final
+     row stretch to fill the width instead of leaving that hole. */
+  grid-template-columns: repeat(6, 1fr);
   gap: 1px;
   background: var(--border);
   border: 1px solid var(--border);
@@ -624,9 +629,37 @@ section h2 {
   overflow: hidden;
 }
 
+.features > .feature {
+  grid-column: span 2;
+}
+
+/* Final row holding a single card: stretch it across the full width. */
+.features > .feature:last-child:nth-child(3n + 1) {
+  grid-column: span 6;
+}
+
+/* Final row holding two: split the width between them. */
+.features > .feature:nth-last-child(2):nth-child(3n + 1),
+.features > .feature:nth-last-child(2):nth-child(3n + 1) ~ .feature {
+  grid-column: span 3;
+}
+
 @media (max-width: 780px) {
+  /* Two per row: four tracks, cards spanning two. The three-per-row rules above
+     must be reset or they would still match at this width. */
   .features {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .features > .feature,
+  .features > .feature:last-child:nth-child(3n + 1),
+  .features > .feature:nth-last-child(2):nth-child(3n + 1),
+  .features > .feature:nth-last-child(2):nth-child(3n + 1) ~ .feature {
+    grid-column: span 2;
+  }
+
+  .features > .feature:last-child:nth-child(2n + 1) {
+    grid-column: span 4;
   }
 }
 
