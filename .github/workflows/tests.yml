@@ -58,7 +58,7 @@ jobs:
 
     - name: Upload the scenario report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: scenario-report-py${{ matrix.python-version }}
         path: reports/test_report.md
